@@ -22,13 +22,16 @@ def save_checkpoint(models: dict, opt: torch.optim.Optimizer, step: int, path: s
         ckpt[name] = model.state_dict()
     torch.save(ckpt, path)
 
-def load_checkpoint(models: dict, opt: torch.optim.Optimizer | None, path: str, device: torch.device) -> int:
+def load_checkpoint(models: dict, opt: torch.optim.Optimizer | None, path: str, device: torch.device, load_opt: bool = True) -> int:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     for name, model in models.items():
         if name in ckpt:
             model.load_state_dict(ckpt[name])
-    if opt is not None and "opt_state" in ckpt:
-        opt.load_state_dict(ckpt["opt_state"])
+    if opt is not None and load_opt and "opt_state" in ckpt:
+        try:
+            opt.load_state_dict(ckpt["opt_state"])
+        except ValueError:
+            print(f"  Warning: optimizer state mismatch (phase change?), skipping opt_state")
     return ckpt.get("step", 0)
 
 
@@ -63,10 +66,14 @@ def train(args):
     # ── resume ──
     start_step = 0
     if args.resume:
-        models = {"encoder": encoder, "decoder": decoder, "speaker_enc": speaker_enc}
+        models = {"encoder": encoder, "decoder": decoder, "speaker_enc": speaker_enc, "prosody": prosody}
         if args.phase >= 1:
             models["vfn"] = vfn
         start_step = load_checkpoint(models, opt, args.resume, device)
+        # Reset step counter on phase change
+        if start_step >= args.steps:
+            print(f"  Phase change detected (resume step {start_step} >= target {args.steps}), resetting counter")
+            start_step = 0
         print(f"  Resumed from step {start_step}")
 
     # ── data ──
