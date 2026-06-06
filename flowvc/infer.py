@@ -133,8 +133,14 @@ class FlowVCInference:
 
 
 def load_models(checkpoint_path: str, device: str):
-    """Load all models from checkpoint."""
+    """Load all models from checkpoint with explicit error on missing keys."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    required = ["encoder", "decoder"]
+    for key in required:
+        if key not in ckpt:
+            raise KeyError(f"Missing '{key}' in checkpoint. Available: {list(ckpt.keys())}")
+
     encoder = make_encoder().to(device)
     decoder = F3Decoder(DecoderConfig()).to(device)
     vfn = make_vector_field_net().to(device)
@@ -143,8 +149,9 @@ def load_models(checkpoint_path: str, device: str):
 
     encoder.load_state_dict(ckpt["encoder"])
     decoder.load_state_dict(ckpt["decoder"])
-    vfn.load_state_dict(ckpt.get("vfn", {}))
-    speaker_enc.load_state_dict(ckpt.get("speaker_enc", {}))
+    vfn.load_state_dict(ckpt.get("vfn", vfn.state_dict()))  # fallback to random if missing
+    speaker_enc.load_state_dict(ckpt.get("speaker_enc", speaker_enc.state_dict()))
+    prosody.load_state_dict(ckpt.get("prosody", prosody.state_dict()))
     return encoder, decoder, vfn, speaker_enc, prosody
 
 

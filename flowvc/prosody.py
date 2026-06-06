@@ -37,6 +37,7 @@ class FCPEProsodyExtractor(nn.Module):
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
         self._ensure_fcpe()
         self._ensure_resamplers()
+        wav = wav.to(self.device)
 
         B = wav.size(0)
         results = []

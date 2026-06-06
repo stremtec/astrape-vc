@@ -148,6 +148,6 @@ class F3Decoder(nn.Module):
         return x
 
 
-def make_decoder(**kwargs) -> F3Decoder:
+def make_decoder(speaker_dim: int = 192, **kwargs) -> F3Decoder:
     cfg = DecoderConfig(**kwargs)
-    return F3Decoder(cfg)
+    return F3Decoder(cfg, speaker_dim=speaker_dim)

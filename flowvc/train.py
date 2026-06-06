@@ -110,9 +110,13 @@ def train(args):
 
             else:
                 # ── Phase 2: E2E ──
+                speaker_enc.eval(); prosody.eval()
+                for m in [speaker_enc, prosody]:
+                    for p in m.parameters(): p.requires_grad = False
                 z_src = encoder.encode(src)
-                spk_emb, prompt = speaker_enc(ref)
-                pros = prosody(src)
+                with torch.no_grad():
+                    spk_emb, prompt = speaker_enc(ref)
+                    pros = prosody(src)
 
                 from .converter import solve_cfm_euler
                 z_tgt = solve_cfm_euler(vfn, z_src, spk_emb, prompt, pros, n_steps=4)
@@ -134,7 +138,7 @@ def train(args):
                 running_loss = 0.0
 
             if step % args.save_interval == 0:
-                models = {"encoder": encoder, "decoder": decoder, "speaker_enc": speaker_enc}
+                models = {"encoder": encoder, "decoder": decoder, "speaker_enc": speaker_enc, "prosody": prosody}
                 if args.phase >= 1:
                     models["vfn"] = vfn
                 ckpt_path = os.path.join(args.output_dir, f"step_{step:07d}.pt")
@@ -142,7 +146,7 @@ def train(args):
                 print(f"  saved: {ckpt_path}")
 
     # Final save
-    models = {"encoder": encoder, "decoder": decoder, "speaker_enc": speaker_enc}
+    models = {"encoder": encoder, "decoder": decoder, "speaker_enc": speaker_enc, "prosody": prosody}
     if args.phase >= 1:
         models["vfn"] = vfn
     final_path = os.path.join(args.output_dir, "final.pt")
