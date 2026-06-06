@@ -43,7 +43,7 @@ class VCTKDataset(torch.utils.data.Dataset):
         self,
         data_dir: str,
         crop_seconds: float = 2.0,
-        ref_seconds: float = 3.0,
+        ref_seconds: float = 2.0,
         sample_rate: int = SAMPLE_RATE,
         sr_orig: int | None = None,
     ):
@@ -125,9 +125,12 @@ class VCTKDataset(torch.utils.data.Dataset):
             tgt_spk = random.choice([s for s in self.speakers if s != src_spk])
             tgt_path = random.choice(self.speaker_files[tgt_spk])
 
-        # ref audio: different from both src and tgt (when cross-speaker)
+        # ref audio: different from both src and tgt, and different utterance ID
+        src_utt = Path(src_path).stem.replace("_mic1", "").replace("_mic2", "")
+        tgt_utt = Path(tgt_path).stem.replace("_mic1", "").replace("_mic2", "")
         ref_opts = [f for f in self.speaker_files[tgt_spk]
-                    if f != tgt_path and f != src_path]
+                    if f != tgt_path and f != src_path
+                    and Path(f).stem.replace("_mic1", "").replace("_mic2", "") not in (src_utt, tgt_utt)]
         if not ref_opts:
             ref_opts = [f for f in self.speaker_files[tgt_spk] if f != src_path]
         if not ref_opts:
@@ -211,9 +214,11 @@ def build_cache(data_dir: str, cache_dir: str, device: str = "cpu"):
     os.makedirs(cache_dir, exist_ok=True)
     dev = torch.device(device)
 
+    random.seed(42)  # deterministic cache building
+
     encoder = make_encoder().to(dev).eval()
     speaker_enc = make_speaker_encoder().to(dev).eval()
-    prosody_ext = make_prosody_extractor().to(dev).eval()
+    prosody_ext = make_prosody_extractor(device=str(dev)).to(dev).eval()
 
     ds = VCTKDataset(data_dir)
 

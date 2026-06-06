@@ -64,7 +64,7 @@ class GRN(nn.Module):
     ConvNeXt v2's replacement for LayerNorm in the MLP.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-4):
         super().__init__()
         self.eps = eps
         self.gamma = nn.Parameter(torch.zeros(1, 1, dim))
@@ -72,9 +72,9 @@ class GRN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, C)
-        Gx = torch.norm(x, p=2, dim=1, keepdim=True)  # (B, 1, C)
+        Gx = torch.norm(x.float(), p=2, dim=1, keepdim=True)  # (B, 1, C) fp32 safe
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + self.eps)
-        return self.gamma * (x * Nx) + self.beta + x
+        return (self.gamma * (x * Nx.to(x.dtype)) + self.beta + x)
 
 
 # ── AdaLN-Zero ─────────────────────────────────────────────────

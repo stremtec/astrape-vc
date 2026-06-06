@@ -17,7 +17,7 @@ class FlowVCInference:
     """Streaming VC with ring buffer + overlap-add."""
 
     def __init__(self, encoder, decoder, vfn, speaker_enc, prosody_ext,
-                 device="cpu", chunk_ms=80, left_ctx_ms=320, overlap_ms=40, ode_steps=4):
+                 device="cpu", chunk_ms=80, left_ctx_ms=800, overlap_ms=40, ode_steps=4):
         self.device = torch.device(device)
         self.encoder = encoder.to(self.device).eval()
         self.decoder = decoder.to(self.device).eval()
@@ -57,7 +57,12 @@ class FlowVCInference:
 
         t0 = time.time()
 
-        chunk = chunk.to(self.device).unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+        # Normalize to (1, 1, T) — robust to any input shape
+        chunk = chunk.to(self.device)
+        while chunk.dim() < 3:
+            chunk = chunk.unsqueeze(0)
+        if chunk.dim() > 3:
+            chunk = chunk.reshape(1, 1, -1)
 
         # Cold-start: on first chunk, fill buffer with audio to avoid silence context
         if self.stats["chunks"] == 0:
@@ -114,7 +119,7 @@ class FlowVCInference:
         outputs = []
         for start in range(0, audio.shape[-1], self.chunk_samples):
             end = min(start + self.chunk_samples, audio.shape[-1])
-            chunk = audio[start:end]
+            chunk = audio[..., start:end]  # slice last dim to support both 1D and 2D inputs
             if chunk.shape[-1] < self.chunk_samples:
                 chunk = F.pad(chunk, (0, self.chunk_samples - chunk.shape[-1]))
             out = self.process_chunk(chunk)

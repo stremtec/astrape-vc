@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch, torch.nn as nn, torch.nn.functional as F, torchaudio
 
 FCPE_SR, TARGET_SR, TARGET_HZ = 16000, 44100, 25
+_LOG_EPS = 1e-4  # fp16-safe: min normal = 6e-5, 1e-4 is well above
 
 
 class FCPEProsodyExtractor(nn.Module):
@@ -44,9 +45,14 @@ class FCPEProsodyExtractor(nn.Module):
         for b in range(B):
             wb = wav[b:b+1]  # (1, 1, T)
             w16 = self._resampler_16k(wb)  # (1, 1, T16)
+            # FCPE expects (B, T) — squeeze channel dim
+            w16_2d = w16.squeeze(1)  # (1, T16)
 
-            f0 = self._fcpe_model.infer(w16, sr=FCPE_SR, decoder_mode="local_argmax", threshold=0.006)
-            f0 = f0.to(self.device)  # (1, Tf)
+            f0 = self._fcpe_model.infer(w16_2d, sr=FCPE_SR, decoder_mode="local_argmax", threshold=0.006)
+            f0 = f0.to(self.device)  # (B, Tf) or (B, Tf, 1)
+            # Normalize to (B, Tf)
+            if f0.dim() == 3:
+                f0 = f0.squeeze(-1)
 
             # Resample F0 to 25Hz using nearest-neighbor (avoids sinc ringing on pitch contour)
             f0_np = f0.squeeze(0).cpu().numpy() if f0.is_cuda or f0.device.type == "mps" else f0.squeeze(0).numpy()
@@ -55,17 +61,18 @@ class FCPEProsodyExtractor(nn.Module):
             new_len = max(1, int(old_len * TARGET_HZ / 100))
             indices = np.linspace(0, old_len - 1, new_len).round().astype(int)
             f0_25 = torch.from_numpy(f0_np[indices]).to(self.device)
+            # Ensure 1D
             if f0_25.dim() == 0:
                 f0_25 = f0_25.unsqueeze(0)
-            elif f0_25.dim() == 2:
-                f0_25 = f0_25.squeeze(0)
+            if f0_25.dim() == 2:
+                f0_25 = f0_25.squeeze(-1)  # squeeze last dim if (T, 1)
             T25 = f0_25.shape[0]
 
             # Voiced
             voiced = (f0_25 > 1.0).float()
 
             # Log F0
-            log_f0 = torch.where(f0_25 > 1.0, torch.log(f0_25 + 1e-8), torch.zeros_like(f0_25))
+            log_f0 = torch.where(f0_25 > 1.0, torch.log(f0_25 + _LOG_EPS), torch.zeros_like(f0_25))
 
             # Energy: RMS per 25Hz frame
             audio_1d = wb.reshape(-1)  # always 1D, robust to any input shape
@@ -73,10 +80,10 @@ class FCPEProsodyExtractor(nn.Module):
             if T25 > 1:
                 chunks = audio_1d.unfold(0, hop, hop)[:T25]
                 rms = chunks.pow(2).mean(dim=-1).sqrt()
-                log_energy = torch.log(rms + 1e-8)
+                log_energy = torch.log(rms + _LOG_EPS)
             else:
                 rms = audio_1d.pow(2).mean().sqrt()
-                log_energy = torch.log(rms + 1e-8).expand(T25)
+                log_energy = torch.log(rms + _LOG_EPS).expand(T25)
 
             feat = torch.stack([log_f0, voiced, log_energy], dim=-1)  # (T25, 3)
             results.append(feat)

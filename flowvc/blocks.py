@@ -69,8 +69,8 @@ class CausalConvTranspose1d(nn.Module):
 
 class GRN(nn.Module):
     """
-    ConvNeXt v2 の Global Response Normalization。
-    チャネル方向 L2ノルム → 除算正規化 → 学習可能スケール/バイアス。
+    ConvNeXt v2 の Global Response Normalization（因果的版）。
+    チャネル方向のみ集約し、時間軸に依存しない。
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -80,10 +80,10 @@ class GRN(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1, dim, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, T)
-        Gx = torch.norm(x, p=2, dim=-1, keepdim=True)          # (B, C, 1) per-channel temporal L2
-        Nx = Gx / (Gx.mean(dim=1, keepdim=True) + self.eps)    # (B, C, 1) normalize across channels
-        return self.gamma * (x * Nx) + self.beta + x
+        # x: (B, C, T) — causal: no temporal aggregation
+        Gx = torch.norm(x.float(), p=2, dim=1, keepdim=True)   # (B, 1, T) per-timestep cross-channel L2
+        Nx = Gx / (Gx.mean(dim=1, keepdim=True) + self.eps)    # (B, 1, T) normalize
+        return self.gamma.to(x.dtype) * (x * Nx.to(x.dtype)) + self.beta.to(x.dtype) + x
 
 
 # ── ConvNeXt v2 ブロック ────────────────────────────────────────
