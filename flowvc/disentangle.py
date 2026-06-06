@@ -1,25 +1,24 @@
 """
-Kanade-style disentanglement via narrow information bottleneck.
+Kanade-style disentanglement via narrow information bottleneck (v2).
 
-AudioDec latent (64-dim) → two paths:
-  Content: 64 → narrow bottleneck (8-dim) → 64  (forced compression)
-  Speaker: 64 → ConvNeXt → pooling → 32
-
-No auxiliary losses. The 8-dim bottleneck naturally drops speaker info.
+v2 improvements:
+  - Bottleneck 8→16 dim (still narrow, but enough for speaker distinction)
+  - SpeakerEncoder: 4 Conv1d + attention pooling + projection
+  - Per-utterance speaker vector (B, 1, D), caller expands to T
 """
 
 from __future__ import annotations
 import torch, torch.nn as nn, torch.nn.functional as F
 
 AUDIODEC_DIM = 64
-BOTTLENECK_DIM = 8
-SPEAKER_DIM = 64  # matches content dim for addition
+BOTTLENECK_DIM = 16
+SPEAKER_DIM = 64
 
 
 class ContentBottleneck(nn.Module):
     """Narrow bottleneck forces content-only encoding (drops speaker info)."""
 
-    def __init__(self, bottleneck: int = 8):
+    def __init__(self, bottleneck: int = BOTTLENECK_DIM):
         super().__init__()
         dim = AUDIODEC_DIM
         self.compress = nn.Linear(dim, bottleneck)
@@ -31,29 +30,47 @@ class ContentBottleneck(nn.Module):
 
 
 class SpeakerEncoder(nn.Module):
-    """Separate path for speaker info — avoids squeezing through bottleneck."""
+    """
+    Stronger speaker encoder: 4-layer Conv1d + attention pooling.
+    Extracts per-utterance speaker vector.
+    """
 
     def __init__(self):
         super().__init__()
         in_dim, out_dim = AUDIODEC_DIM, SPEAKER_DIM
-        self.conv = nn.Sequential(
-            nn.Conv1d(in_dim, 64, 5, padding=2),
-            nn.GELU(),
-            nn.Conv1d(64, out_dim, 5, padding=2),
+        # 4-layer Conv1d with residual connections
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(in_dim, 128, 5, padding=2), nn.GELU(),
+            nn.Conv1d(128, 128, 5, padding=2), nn.GELU(),
         )
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(128, 256, 5, padding=2), nn.GELU(),
+            nn.Conv1d(256, 256, 5, padding=2), nn.GELU(),
+        )
+        self.proj = nn.Linear(256, out_dim)
+        
+        # Attention pooling: learnable query
+        self.attn_query = nn.Parameter(torch.randn(1, 1, 256) * 0.02)
+        self.attn = nn.MultiheadAttention(256, 4, batch_first=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D) → (B, D, T) for conv
-        h = self.conv(x.transpose(1, 2))
-        h = self.pool(h).squeeze(-1)  # (B, 32)
-        return h
+        # x: (B, T, D) → (B, D, T) for Conv1d
+        h = x.transpose(1, 2)
+        h = self.conv1(h)  # (B, 128, T)
+        h = self.conv2(h)  # (B, 256, T)
+        h = h.transpose(1, 2)  # (B, T, 256)
+        
+        # Attention pooling → per-utterance
+        B = h.size(0)
+        q = self.attn_query.expand(B, -1, -1)
+        pooled, _ = self.attn(q, h, h)
+        spk = self.proj(pooled)  # (B, 1, out_dim)
+        return spk
 
 
 class KanadeDisentangler(nn.Module):
     """
     Disentangle AudioDec latent into content + speaker via architectural bottleneck.
-    No auxiliary losses — bottleneck architecture does the work.
     """
 
     def __init__(self):
@@ -62,15 +79,6 @@ class KanadeDisentangler(nn.Module):
         self.speaker = SpeakerEncoder()
 
     def forward(self, z: torch.Tensor):
-        """
-        Args:
-            z: (B, T, 64) AudioDec latent
-        Returns:
-            z_content: (B, T, 64)
-            z_speaker: (B, 32) per-utterance
-        """
         z_content = self.content(z)
-        z_spk = self.speaker(z)  # (B, 32)
-        # Expand speaker to all time frames
-        z_spk_expanded = z_spk.unsqueeze(1).expand(-1, z.size(1), -1)
-        return z_content, z_spk_expanded
+        z_spk = self.speaker(z)  # (B, 1, 64)
+        return z_content, z_spk

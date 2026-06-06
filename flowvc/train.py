@@ -228,13 +228,26 @@ def train(args):
                 loss = cfm + 0.5 * aux
 
             elif args.phase == 20:
-                # Disentanglement: train content bottleneck + speaker encoder
+                # Disentanglement v2: recon + ECAPA teacher
                 z = encoder.encode(src)
                 z_content, z_spk = disentangler(z)
-                # Decode from content + speaker → reconstruction loss only
-                z_out = z_content + z_spk
-                out = decoder(z_out.cpu()).to(device)
-                loss = F.l1_loss(out, src)
+                
+                # ECAPA teacher: speaker vector should match ECAPA embedding
+                ecapa_emb = speaker_enc(src)
+                if isinstance(ecapa_emb, tuple):
+                    ecapa_emb = ecapa_emb[0]
+                ecapa_emb = ecapa_emb.to(device)
+                # Cosine loss: speaker vector should align with ECAPA (cached proj)
+                spk_vec = z_spk.squeeze(1)  # (B, 64)
+                if not hasattr(disentangler, '_ecapa_proj'):
+                    disentangler._ecapa_proj = torch.randn(64, 192, device=device) * 0.02
+                spk_pred = spk_vec @ disentangler._ecapa_proj
+                speaker_loss = 1 - F.cosine_similarity(spk_pred, ecapa_emb, dim=-1).mean()
+                
+                z_spk_exp = z_spk.expand(-1, z.size(1), -1)
+                z_out = z_content + z_spk_exp
+                out = decoder(z_out)
+                loss = F.l1_loss(out, src) + 2.0 * speaker_loss
 
             elif args.phase == 21:
                 # Converter with disentangled latent
@@ -249,7 +262,7 @@ def train(args):
                 # Split source, keep content, predict target speaker
                 c_src, _ = disentangler(z_src)
                 s_pred = vfn_small(c_src, torch.zeros(1, device=device), ecapa_emb, None, pros)
-                # Reconstruct: source content + predicted speaker
+                # Expand predicted speaker to match content frames
                 s_pred_exp = s_pred.mean(dim=1, keepdim=True).expand(-1, c_src.size(1), -1)
                 z_out = c_src + s_pred_exp
                 out = decoder(z_out)
