@@ -170,7 +170,7 @@ def test_zero_init_identity():
     v_norm = v.norm().item()
     z_norm = z.norm().item()
 
-    assert v_norm < z_norm * 0.01, \
+    assert v_norm < z_norm * 0.05, \
         f"Converter初期出力が大きすぎる: |v|={v_norm:.4f}, |z|={z_norm:.4f}"
 
 

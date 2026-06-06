@@ -58,7 +58,7 @@ def train(args):
     else:  # Phase 2: E2E fine-tune
         vfn = make_vector_field_net().to(device)
         params = list(encoder.parameters()) + list(decoder.parameters()) + list(vfn.parameters())
-        opt = torch.optim.AdamW(params, lr=args.lr * 0.1, betas=(0.8, 0.9))
+        opt = torch.optim.AdamW(params, lr=args.lr * 0.1, betas=(0.9, 0.98))
 
     # ── resume ──
     start_step = 0

@@ -217,7 +217,7 @@ class VectorFieldNet(nn.Module):
 
         # 出力射影
         self.out_proj = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
-        self.out_gate = nn.Parameter(torch.ones(1) * 0.01)  # small positive → gradient flows from step 0
+        self.out_gate = nn.Parameter(torch.ones(1) * 0.1)  # increased from 0.01 for better Phase 2 encoder gradient flow
 
     def _assemble_cond(
         self, t: torch.Tensor, speaker_emb: torch.Tensor,
@@ -240,7 +240,9 @@ class VectorFieldNet(nn.Module):
                     prosody = F.pad(prosody, (0, 0, 0, T - prosody.size(1)))
             cond_cat = torch.cat([spk, prosody], dim=-1)
         else:
-            cond_cat = spk
+            # Pad with zeros to match cond_in dimension (speaker_dim + prosody_dim)
+            prosody_zeros = torch.zeros(B, T, self.cfg.prosody_dim, device=spk.device)
+            cond_cat = torch.cat([spk, prosody_zeros], dim=-1)
 
         cond = self.cond_proj(cond_cat)  # (B, T, cond_dim)
         return torch.cat([cond, t_emb], dim=-1)  # (B, T, cond_dim + time_dim)
