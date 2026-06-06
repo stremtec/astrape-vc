@@ -65,11 +65,9 @@ def train(args):
         dilations=(1, 2, 4, 8, 1, 2, 4, 8),
     ).to(device)
 
-    # ECAPA speaker encoder (pretrained, frozen)
-    speaker_enc = ECAPASpeakerEncoder(device=str(device)).to(device)
-    speaker_enc.eval()
-    for p in speaker_enc.parameters():
-        p.requires_grad = False
+    # ECAPA on CPU (too large for MPS alongside AudioDec)
+    speaker_enc = ECAPASpeakerEncoder(device="cpu")
+    # Don't .to(device) — keep on CPU to save MPS memory
     prosody = make_prosody_extractor(device=str(device)).to(device)
 
     cfm_loss = CFMLoss(sigma_min=0.001)
@@ -77,14 +75,13 @@ def train(args):
     # ── Phase 1: CFM (VFN only) ──
     if args.phase == 1:
         decoder.eval()
-        speaker_enc.eval()
         prosody.eval()
-        for m in [decoder, speaker_enc, prosody]:
+        for m in [decoder, prosody]:
             for p in m.parameters():
                 p.requires_grad = False
         params = list(vfn.parameters())
         opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.98))
-        model_dict = {"vfn": vfn, "speaker_enc": speaker_enc, "prosody": prosody}
+        model_dict = {"vfn": vfn, "prosody": prosody}
 
     # ── Phase 2: E2E (VFN only, decoder frozen, audio-domain loss) ──
     else:
@@ -122,6 +119,8 @@ def train(args):
                     z_src = encoder.encode(src)
                     z_tgt = encoder.encode(tgt)
                     spk_emb, prompt = speaker_enc(ref)
+                    spk_emb = spk_emb.to(device)
+                    prompt = prompt.to(device)
                     pros = prosody(src)
                 loss, _ = cfm_loss(vfn, z_src, z_tgt, spk_emb, prompt, pros)
 
@@ -129,6 +128,8 @@ def train(args):
                 with torch.no_grad():
                     z_src = encoder.encode(src)
                     spk_emb, prompt = speaker_enc(ref)
+                    spk_emb = spk_emb.to(device)
+                    prompt = prompt.to(device)
                     pros = prosody(src)
                 z_tgt = solve_cfm_euler(vfn, z_src, spk_emb, prompt, pros, n_steps=4)
                 out = decoder(z_tgt)
