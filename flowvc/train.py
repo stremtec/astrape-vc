@@ -53,8 +53,8 @@ def train(args):
     for p in encoder.parameters():
         p.requires_grad = False
 
-    # AudioDec decoder (on CPU to save MPS memory — used only in Phase 2 forward)
-    decoder = AudioDecDecoder(device="cpu")
+    # AudioDec decoder
+    decoder = AudioDecDecoder(device=str(device)).to(device)
 
     # Optional modules (used only in specific phases)
     disentangler = None
@@ -114,6 +114,7 @@ def train(args):
         params = list(disentangler.parameters())
         opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.98))
         model_dict = {"disentangler": disentangler}
+        # Lightweight save: only disentangler (few KB), skip frozen encoder/decoder
 
     # ── Phase 21: Converter with disentangled latent ──
     elif args.phase == 21:
@@ -251,7 +252,7 @@ def train(args):
                 # Reconstruct: source content + predicted speaker
                 s_pred_exp = s_pred.mean(dim=1, keepdim=True).expand(-1, c_src.size(1), -1)
                 z_out = c_src + s_pred_exp
-                out = decoder(z_out.cpu()).to(device)
+                out = decoder(z_out)
                 loss = F.l1_loss(out, tgt)
 
             elif args.phase == 12:
@@ -325,6 +326,7 @@ def train(args):
                 running_loss = 0.0
 
             if step % args.save_interval == 0:
+                torch.mps.empty_cache()  # prevent OOM on save
                 save_checkpoint(model_dict, opt, step,
                               os.path.join(args.output_dir, f"step_{step:07d}.pt"))
 
