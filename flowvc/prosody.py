@@ -1,13 +1,10 @@
 """
-FlowVC 韻律抽出器。
+FlowVC prosody extractor using FCPE (Fast Context-aware Pitch Extractor).
 
-ソース音声からフレーム単位の韻律特徴を抽出:
-  - log_f0: 対数基本周波数
-  - voiced: 有声/無声フラグ
-  - log_energy: 対数RMSエネルギー
+FCPE runs at 16kHz, outputs ~100Hz F0 frames → resampled to 25Hz.
+Provides log_f0, voiced flag, and log_energy per frame.
 
-軽量ConvNet → 適応的プーリング → 25Hzフレームレート。
-btrv3lite f0.py の RMVPE/PENN 抽出器を再利用可能。
+Ref: CNChTu/FCPE (torchfcpe)
 """
 
 from __future__ import annotations
@@ -15,65 +12,103 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
 
-from .blocks import CausalConv1d
+
+FCPE_SR = 16000
+TARGET_SR = 44100
+TARGET_HZ = 25
 
 
-class ProsodyExtractor(nn.Module):
+class FCPEProsodyExtractor(nn.Module):
     """
-    軽量韻律抽出器。
+    FCPE-based prosody extractor.
 
-    アーキテクチャ:
-      波形 (44.1kHz) → 4層 Causal ConvNet
-      → AdaptiveAvgPool1d → (T_lat, 3)
+    Output per frame:
+      [0]: log_f0     — log-scale fundamental frequency (0 if unvoiced)
+      [1]: voiced     — voicing probability
+      [2]: log_energy — log-scale RMS energy
     """
 
-    def __init__(
-        self,
-        hidden_dim: int = 128,
-        kernel_size: int = 15,
-        output_dim: int = 3,
-        hop_samples: int = 1764,  # 25Hz @ 44.1kHz
-    ):
+    def __init__(self, device: str = "cpu"):
         super().__init__()
-        self.hop_samples = hop_samples
+        self.device = device
+        self._fcpe_model = None
+        self._resampler_16k = None
+        self._resampler_25hz = None
 
-        self.conv1 = CausalConv1d(1, 32, kernel_size=kernel_size)
-        self.conv2 = CausalConv1d(32, 64, kernel_size=kernel_size)
-        self.conv3 = CausalConv1d(64, hidden_dim, kernel_size=kernel_size)
-        self.conv4 = CausalConv1d(hidden_dim, output_dim, kernel_size=kernel_size)
+    def _ensure_fcpe(self):
+        if self._fcpe_model is None:
+            try:
+                import torchfcpe
+                # FCPE has MPS padding bug — always use CPU
+                self._fcpe_model = torchfcpe.spawn_bundled_infer_model(device="cpu")
+            except ImportError:
+                raise ImportError(
+                    "torchfcpe not installed. "
+                    "Install: pip install git+https://github.com/CNChTu/FCPE.git"
+                )
 
-        self.act = nn.GELU()
+    def _ensure_resamplers(self):
+        if self._resampler_16k is None:
+            self._resampler_16k = torchaudio.transforms.Resample(
+                orig_freq=TARGET_SR, new_freq=FCPE_SR,
+            ).to(self.device)
+        if self._resampler_25hz is None:
+            self._resampler_25hz = torchaudio.transforms.Resample(
+                orig_freq=100, new_freq=TARGET_HZ,  # FCPE outputs ~100Hz
+            ).to(self.device)
 
+    @torch.no_grad()
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            wav: (B, 1, T_audio) 波形 @ 44.1kHz
+            wav: (B, 1, T) waveform @ 44100Hz
         Returns:
-            prosody: (B, T_lat, 3)
-              [:, :, 0]: log_f0 (logスケール基本周波数)
-              [:, :, 1]: voiced (有声確率, sigmoid)
-              [:, :, 2]: log_energy (logスケールRMSエネルギー)
+            prosody: (B, T_lat, 3) — [log_f0, voiced, log_energy]
         """
-        x = self.act(self.conv1(wav))
-        x = self.act(self.conv2(x))
-        x = self.act(self.conv3(x))
-        x = self.conv4(x)  # (B, 3, T_audio)
+        self._ensure_fcpe()
+        self._ensure_resamplers()
 
-        # 適応的プーリングで25Hzにダウンサンプル
-        T_lat = max(1, wav.shape[2] // self.hop_samples)
-        x = F.adaptive_avg_pool1d(x, T_lat)  # (B, 3, T_lat)
+        B = wav.size(0)
+        results = []
 
-        # 転置して (B, T_lat, 3)
-        x = x.transpose(1, 2)
+        for b in range(B):
+            # Extract F0 via FCPE
+            wav_b = wav[b:b+1]  # (1, 1, T)
+            wav_16k = self._resampler_16k(wav_b)  # (1, 1, T_16k)
 
-        # 活性化
-        f0 = x[:, :, 0:1]  # log_f0: そのまま
-        voiced = x[:, :, 1:2].sigmoid()  # 有声確率
-        energy = x[:, :, 2:3]  # log_energy: そのまま
+            # FCPE runs on CPU (MPS padding bug)
+            wav_cpu = wav_16k.cpu()
+            f0 = self._fcpe_model.infer(
+                wav_cpu,
+                sr=FCPE_SR,
+                decoder_mode="local_argmax",
+                threshold=0.006,
+            )  # (1, T_frames)
+            f0 = f0.to(self.device)
 
-        return torch.cat([f0, voiced, energy], dim=-1)
+            # Resample to 25Hz
+            f0_25hz = self._resampler_25hz(f0.unsqueeze(0)).squeeze(0).squeeze(0)  # (T_lat,)
+
+            # Voiced flag: F0 > 0
+            voiced = (f0_25hz > 1.0).float()  # (T_lat,)
+
+            # Log F0 (0 for unvoiced)
+            log_f0 = torch.where(f0_25hz > 1.0, torch.log(f0_25hz + 1e-8), torch.zeros_like(f0_25hz))
+
+            # Log energy per frame
+            T_lat = log_f0.shape[0]
+            hop = wav_b.shape[2] // max(T_lat, 1)
+            energy = wav_b.squeeze(0).squeeze(0).unfold(0, hop, hop)[:T_lat]
+            rms = energy.pow(2).mean(dim=-1).sqrt()
+            log_energy = torch.log(rms + 1e-8)
+
+            feat = torch.stack([log_f0, voiced, log_energy], dim=-1)  # (T_lat, 3)
+            results.append(feat)
+
+        return torch.stack(results, dim=0)  # (B, T_lat, 3)
 
 
-def make_prosody_extractor(**kwargs) -> ProsodyExtractor:
-    return ProsodyExtractor(**kwargs)
+def make_prosody_extractor(device: str = "cpu") -> FCPEProsodyExtractor:
+    return FCPEProsodyExtractor(device=device)

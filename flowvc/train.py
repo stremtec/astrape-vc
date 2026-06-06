@@ -1,223 +1,169 @@
 """
-FlowVC 学習パイプライン。
-
-3フェーズ学習:
-  フェーズ0: AE事前学習 — エンコーダ+デコーダの再構成のみ
-  フェーズ1: CFM学習 — フローマッチング変換器の学習
-  フェーズ2: E2E+GAN — 全体end-to-end微調整 + 敵対的損失
-
-使用方法:
-    python -m flowvc.train --phase 0 --data-dir /path/to/data \\
-        --output-dir runs/phase0 --device cuda --batch-size 8
-
-    python -m flowvc.train --phase 1 --resume runs/phase0/ae_final.pt \\
-        --output-dir runs/phase1 --device cuda --batch-size 8
-
-    python -m flowvc.train --phase 2 --resume runs/phase1/cfm_step100000.pt \\
-        --output-dir runs/phase2 --device mps --batch-size 1
+FlowVC training pipeline with real data loader + checkpoint save/resume.
 """
 
 from __future__ import annotations
+import argparse, json, os, sys, time
+import torch, torch.nn as nn, torch.nn.functional as F
 
-import argparse
-import json
-import os
-import sys
-import time
-from pathlib import Path
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from .config import EncoderConfig, DecoderConfig, FlowConverterConfig, TrainConfig
-from .encoder import F3Encoder, make_encoder
+from .config import EncoderConfig, DecoderConfig, FlowConverterConfig
+from .encoder import make_encoder
 from .decoder import F3Decoder
-from .converter import VectorFieldNet, make_vector_field_net
-from .speaker import SpeakerEncoder, make_speaker_encoder
-from .prosody import ProsodyExtractor, make_prosody_extractor
+from .converter import make_vector_field_net
+from .speaker import make_speaker_encoder
+from .prosody import make_prosody_extractor
 from .cfm_loss import CFMLoss
+from .dataset import VCTKDataset, create_dataloader
 
 
-# ── フェーズ0: AE事前学習 ────────────────────────────────────────
+def save_checkpoint(models: dict, opt: torch.optim.Optimizer, step: int, path: str):
+    ckpt = {"step": step, "opt_state": opt.state_dict()}
+    for name, model in models.items():
+        ckpt[name] = model.state_dict()
+    torch.save(ckpt, path)
 
-def train_phase0(args):
-    """
-    エンコーダ+デコーダの自己再構成学習。
-    KLフリー、ノイズ正則化、L1波形損失 + マルチ解像度STFT損失。
-    """
+def load_checkpoint(models: dict, opt: torch.optim.Optimizer | None, path: str, device: torch.device) -> int:
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    for name, model in models.items():
+        if name in ckpt:
+            model.load_state_dict(ckpt[name])
+    if opt is not None and "opt_state" in ckpt:
+        opt.load_state_dict(ckpt["opt_state"])
+    return ckpt.get("step", 0)
+
+
+def train(args):
     device = torch.device(args.device)
+    os.makedirs(args.output_dir, exist_ok=True)
 
+    # ── models ──
     encoder = make_encoder().to(device)
     decoder = F3Decoder(DecoderConfig()).to(device)
-    prosody = make_prosody_extractor().to(device)
+    speaker_enc = make_speaker_encoder().to(device)
+    prosody = make_prosody_extractor(device=str(device)).to(device)
 
-    opt = torch.optim.AdamW(
-        list(encoder.parameters()) + list(decoder.parameters()) + list(prosody.parameters()),
-        lr=args.lr, betas=(0.8, 0.9), weight_decay=0.01,
-    )
+    print(f"[Phase {args.phase}] device={device}, batch={args.batch_size}, steps={args.steps}")
 
-    print(f"[Phase 0] AE事前学習")
-    print(f"  デバイス: {device}, バッチサイズ: {args.batch_size}")
-    print(f"  エンコーダ: {sum(p.numel() for p in encoder.parameters()):,} params")
-    print(f"  デコーダ:   {sum(p.numel() for p in decoder.parameters()):,} params")
+    # ── optimizer ──
+    if args.phase == 0:  # AE pretrain: encoder + decoder + prosody
+        params = list(encoder.parameters()) + list(decoder.parameters())
+        opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.8, 0.9), weight_decay=0.01)
+    elif args.phase == 1:  # CFM: only VFN
+        vfn = make_vector_field_net().to(device)
+        encoder.eval(); decoder.eval(); speaker_enc.eval(); prosody.eval()
+        for m in [encoder, decoder, speaker_enc, prosody]:
+            for p in m.parameters(): p.requires_grad = False
+        params = list(vfn.parameters())
+        opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.8, 0.9))
+    else:  # Phase 2: E2E fine-tune
+        vfn = make_vector_field_net().to(device)
+        params = list(encoder.parameters()) + list(decoder.parameters()) + list(vfn.parameters())
+        opt = torch.optim.AdamW(params, lr=args.lr * 0.1, betas=(0.8, 0.9))
 
-    # ダミーデータでスモークテスト
-    B, T_audio = args.batch_size, 44100  # 1秒
-    wav = torch.randn(B, 1, T_audio, device=device)
+    # ── resume ──
+    start_step = 0
+    if args.resume:
+        models = {"encoder": encoder, "decoder": decoder, "speaker_enc": speaker_enc}
+        if args.phase >= 1:
+            models["vfn"] = vfn
+        start_step = load_checkpoint(models, opt, args.resume, device)
+        print(f"  Resumed from step {start_step}")
 
-    z = encoder(wav, training=True)
-    recon = decoder(z, torch.randn(B, 192, device=device))
+    # ── data ──
+    if not args.data_dir:
+        print("ERROR: --data-dir required")
+        return
+    ds = VCTKDataset(args.data_dir, crop_seconds=2.0)
+    loader = create_dataloader(ds, batch_size=args.batch_size, shuffle=True)
 
-    loss = F.l1_loss(recon, wav)
+    # ── CFM loss ──
+    cfm_loss = CFMLoss(sigma_min=0.001) if args.phase >= 1 else None
 
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
+    # ── training loop ──
+    step = start_step
+    running_loss = 0.0
 
-    print(f"  再構成L1損失: {loss.item():.4f}")
-    print(f"  勾配バックワード: OK")
+    while step < args.steps:
+        for batch in loader:
+            if step >= args.steps:
+                break
 
-    # TODO: 実際のデータローダ + 完全な学習ループ
-    print("  [TODO] データローダと本格的な学習ループの実装が必要")
+            src = batch["src_wav"].to(device)
+            tgt = batch["tgt_wav"].to(device)
+            ref = batch["ref_wav"].to(device)
 
-    return encoder, decoder, prosody
+            if args.phase == 0:
+                # ── Phase 0: AE reconstruction ──
+                z = encoder(src, training=True)
+                spk_emb, prompt = speaker_enc(ref)
+                recon = decoder(z, spk_emb)
+                loss = F.l1_loss(recon, src)
 
+            elif args.phase == 1:
+                # ── Phase 1: CFM ──
+                with torch.no_grad():
+                    z_src = encoder.encode(src)
+                    z_tgt = encoder.encode(tgt)
+                    spk_emb, prompt = speaker_enc(ref)
+                    pros = prosody(src)
+                loss, logs = cfm_loss(vfn, z_src, z_tgt, spk_emb, prompt, pros)
 
-# ── フェーズ1: CFM学習 ──────────────────────────────────────────
+            else:
+                # ── Phase 2: E2E ──
+                z_src = encoder.encode(src)
+                spk_emb, prompt = speaker_enc(ref)
+                pros = prosody(src)
 
-def train_phase1(args, encoder, prosody, speaker_enc):
-    """
-    フローマッチング変換器の学習。
-    OTパス + CFM損失。エンコーダ/プロソディ/話者エンコーダは凍結。
-    """
-    device = torch.device(args.device)
+                from .converter import solve_cfm_euler
+                z_tgt = solve_cfm_euler(vfn, z_src, spk_emb, prompt, pros, n_steps=4)
+                out = decoder(z_tgt, spk_emb)
+                loss = F.l1_loss(out, tgt)
 
-    vfn = make_vector_field_net().to(device)
-    cfm_loss = CFMLoss(sigma_min=0.001)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
 
-    opt = torch.optim.AdamW(vfn.parameters(), lr=args.lr, betas=(0.8, 0.9))
+            running_loss += loss.item()
+            step += 1
 
-    print(f"\n[Phase 1] CFM学習")
-    print(f"  デバイス: {device}, バッチサイズ: {args.batch_size}")
-    print(f"  VFN: {sum(p.numel() for p in vfn.parameters()):,} params")
+            if step % args.log_interval == 0:
+                avg = running_loss / args.log_interval
+                elapsed = time.time()
+                print(f"  step {step:>7d}/{args.steps}  loss={avg:.6f}")
+                running_loss = 0.0
 
-    # 凍結
-    encoder.eval()
-    prosody.eval()
-    speaker_enc.eval()
-    for m in [encoder, prosody, speaker_enc]:
-        for p in m.parameters():
-            p.requires_grad = False
+            if step % args.save_interval == 0:
+                models = {"encoder": encoder, "decoder": decoder, "speaker_enc": speaker_enc}
+                if args.phase >= 1:
+                    models["vfn"] = vfn
+                ckpt_path = os.path.join(args.output_dir, f"step_{step:07d}.pt")
+                save_checkpoint(models, opt, step, ckpt_path)
+                print(f"  saved: {ckpt_path}")
 
-    # スモークテスト
-    B, T_audio = args.batch_size, 44100
-    wav_src = torch.randn(B, 1, T_audio, device=device)
-    wav_tgt = torch.randn(B, 1, T_audio, device=device)
-    wav_ref = torch.randn(B, 1, T_audio, device=device)
+    # Final save
+    models = {"encoder": encoder, "decoder": decoder, "speaker_enc": speaker_enc}
+    if args.phase >= 1:
+        models["vfn"] = vfn
+    final_path = os.path.join(args.output_dir, "final.pt")
+    save_checkpoint(models, opt, step, final_path)
+    print(f"  final: {final_path}")
 
-    with torch.no_grad():
-        z_src = encoder.encode(wav_src)
-        z_tgt = encoder.encode(wav_tgt)
-        spk_emb, prompt = speaker_enc(wav_ref)
-        pros = prosody(wav_src)
-
-    loss, logs = cfm_loss(vfn, z_src, z_tgt, spk_emb, prompt, pros)
-
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-
-    print(f"  CFM損失: {loss.item():.4f}")
-    print(f"  勾配バックワード: OK")
-
-    return vfn
-
-
-# ── フェーズ2: E2E微調整 ────────────────────────────────────────
-
-def train_phase2(args, encoder, decoder, vfn, speaker_enc, prosody):
-    """
-    End-to-end微調整 + 敵対的GAN損失。
-    全コンポーネントを低学習率で共同最適化。
-    """
-    device = torch.device(args.device)
-
-    params = (
-        list(encoder.parameters()) +
-        list(decoder.parameters()) +
-        list(vfn.parameters())
-    )
-    opt = torch.optim.AdamW(params, lr=args.lr * 0.1, betas=(0.8, 0.9))
-
-    print(f"\n[Phase 2] E2E+GAN微調整")
-    print(f"  デバイス: {device}, バッチサイズ: {args.batch_size}")
-    print(f"  LR: {args.lr * 0.1}")
-
-    # スモークテスト
-    B, T_audio = args.batch_size, 44100
-    wav_src = torch.randn(B, 1, T_audio, device=device)
-    wav_ref = torch.randn(B, 1, T_audio, device=device)
-
-    z_src = encoder.encode(wav_src)
-    spk_emb, prompt = speaker_enc(wav_ref)
-    pros = prosody(wav_src)
-
-    from .converter import solve_cfm_euler
-    z_tgt = solve_cfm_euler(vfn, z_src, spk_emb, prompt, pros, n_steps=4)
-    out = decoder(z_tgt, spk_emb)
-
-    loss = F.l1_loss(out, wav_src)
-
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-
-    print(f"  E2E損失: {loss.item():.4f}")
-    print(f"  勾配バックワード: OK")
-
-
-# ── CLI ─────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="FlowVC 学習")
-    parser.add_argument("--phase", type=int, default=0,
-                        help="学習フェーズ: 0=AE, 1=CFM, 2=E2E")
-    parser.add_argument("--data-dir", type=str, default="",
-                        help="データディレクトリ")
-    parser.add_argument("--output-dir", type=str, default="./runs",
-                        help="出力ディレクトリ")
-    parser.add_argument("--device", type=str, default="cpu",
-                        help="デバイス: cpu, cuda, mps")
+    parser = argparse.ArgumentParser(description="FlowVC training")
+    parser.add_argument("--phase", type=int, default=0)
+    parser.add_argument("--data-dir", type=str, required=True)
+    parser.add_argument("--output-dir", type=str, default="./runs")
+    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps", type=int, default=200000)
-    parser.add_argument("--resume", type=str, default="",
-                        help="再開用チェックポイント")
+    parser.add_argument("--log-interval", type=int, default=50)
+    parser.add_argument("--save-interval", type=int, default=1000)
+    parser.add_argument("--resume", type=str, default="")
     args = parser.parse_args()
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    if args.phase == 0:
-        train_phase0(args)
-
-    elif args.phase == 1:
-        # 簡易: 新しいエンコーダを作成（実際は--resumeからロード）
-        encoder = make_encoder().to(args.device)
-        prosody = make_prosody_extractor().to(args.device)
-        speaker_enc = make_speaker_encoder().to(args.device)
-        train_phase1(args, encoder, prosody, speaker_enc)
-
-    elif args.phase == 2:
-        encoder = make_encoder().to(args.device)
-        decoder = F3Decoder(DecoderConfig()).to(args.device)
-        vfn = make_vector_field_net().to(args.device)
-        speaker_enc = make_speaker_encoder().to(args.device)
-        prosody = make_prosody_extractor().to(args.device)
-        train_phase2(args, encoder, decoder, vfn, speaker_enc, prosody)
-
-    else:
-        print(f"未知のフェーズ: {args.phase}")
+    train(args)
 
 
 if __name__ == "__main__":

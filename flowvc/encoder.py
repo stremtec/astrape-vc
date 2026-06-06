@@ -54,14 +54,16 @@ class F3Encoder(nn.Module):
         # 最終正規化
         self.norm = nn.LayerNorm(cfg.stages[-1])
 
-    def forward(self, wav: torch.Tensor, training: bool = True) -> torch.Tensor:
+    def forward(self, wav: torch.Tensor, training: bool | None = None) -> torch.Tensor:
         """
         Args:
-            wav: (B, 1, T_audio) 波形 @ 44.1kHz
-            training: Trueの場合、ノイズ正則化を適用
+            wav: (B, 1, T_audio) waveform @ 44.1kHz
+            training: if True add noise regularization. None → use self.training.
         Returns:
             z: (B, T_lat, content_dim) @ 25Hz
         """
+        if training is None:
+            training = self.training
         x = self.stages(wav)  # (B, C_out, T_lat)
 
         # → (B, T_lat, C_out)

@@ -81,8 +81,8 @@ class GRN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T)
-        Gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
-        Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + self.eps)
+        Gx = torch.norm(x, p=2, dim=-1, keepdim=True)          # (B, C, 1) per-channel temporal L2
+        Nx = Gx / (Gx.mean(dim=1, keepdim=True) + self.eps)    # (B, C, 1) normalize across channels
         return self.gamma * (x * Nx) + self.beta + x
 
 

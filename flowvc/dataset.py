@@ -101,12 +101,11 @@ class VCTKDataset(torch.utils.data.Dataset):
             wav = wav.mean(dim=0, keepdim=True)
         wav = wav.squeeze(0)  # (T,)
 
-        # 長さ調整
-        if wav.shape[-1] < target_samples:
-            # 短い → 繰り返し
-            repeats = target_samples // wav.shape[-1] + 1
-            wav = wav.repeat(repeats)
-        wav = wav[:target_samples]
+        # Truncate or zero-pad (no repeat to avoid phase discontinuity)
+        if wav.shape[-1] > target_samples:
+            wav = wav[:target_samples]
+        elif wav.shape[-1] < target_samples:
+            wav = F.pad(wav, (0, target_samples - wav.shape[-1]))
 
         return wav
 
@@ -126,8 +125,11 @@ class VCTKDataset(torch.utils.data.Dataset):
             tgt_spk = random.choice([s for s in self.speakers if s != src_spk])
             tgt_path = random.choice(self.speaker_files[tgt_spk])
 
-        # 参照音声（ターゲット話者の別発話）
-        ref_opts = [f for f in self.speaker_files[tgt_spk] if f != tgt_path]
+        # ref audio: different from both src and tgt (when cross-speaker)
+        ref_opts = [f for f in self.speaker_files[tgt_spk]
+                    if f != tgt_path and f != src_path]
+        if not ref_opts:
+            ref_opts = [f for f in self.speaker_files[tgt_spk] if f != src_path]
         if not ref_opts:
             ref_opts = [tgt_path]
         ref_path = random.choice(ref_opts)
@@ -260,7 +262,7 @@ def main():
         build_cache(args.data_dir, args.cache_dir, args.device)
     else:
         # データセット読み込みテスト
-        ds = VCTKDataset(args.data_dir or "/Users/asill/asill/research2/datasets/vctk/wav48_silence_trimmed")
+        ds = VCTKDataset(args.data_dir)
         item = ds[0]
         print(f"  src_wav: {item['src_wav'].shape}")
         print(f"  tgt_wav: {item['tgt_wav'].shape}")

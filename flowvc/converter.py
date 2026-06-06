@@ -131,7 +131,7 @@ class FlowBlock(nn.Module):
         self.pwconv2 = nn.Linear(hidden, dim)
 
         # LayerScale
-        self.gamma = nn.Parameter(torch.zeros(1, 1, dim))
+        self.gamma = nn.Parameter(torch.ones(1, 1, dim) * 1e-5)  # near-zero → near-identity with small gradient
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """
@@ -217,7 +217,7 @@ class VectorFieldNet(nn.Module):
 
         # 出力射影
         self.out_proj = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
-        self.out_gate = nn.Parameter(torch.zeros(1))  # ゼロ初期化 → 恒等写像
+        self.out_gate = nn.Parameter(torch.ones(1) * 0.01)  # small positive → gradient flows from step 0
 
     def _assemble_cond(
         self, t: torch.Tensor, speaker_emb: torch.Tensor,
@@ -293,9 +293,14 @@ def solve_cfm_euler(
     dt = 1.0 / n_steps
 
     for i in range(n_steps):
-        t = torch.full((z_src.size(0),), i * dt, device=z.device)
+        t = torch.full((z_src.size(0),), i / n_steps, device=z.device)
         v = vfn(z, t, speaker_emb, prompt_tokens, prosody)
         z = z + v * dt
+
+    # Final step at t=1 for boundary accuracy
+    t_end = torch.ones(z_src.size(0), device=z.device)
+    v_end = vfn(z, t_end, speaker_emb, prompt_tokens, prosody)
+    z = z + v_end * dt * 0.5  # half-step refinement at boundary
 
     return z
 

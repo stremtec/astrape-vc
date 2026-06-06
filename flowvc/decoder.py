@@ -81,19 +81,12 @@ class DecoderStage(nn.Module):
 class F3Decoder(nn.Module):
     """
     因果的デコーダ: 潜在 → 波形。
-    
-    アーキテクチャ:
-      z (T_lat, 768) → FiLM → ConvNeXtブロック
-      → 6段アップサンプリング (ストライド: 7,7,3,3,2,2 = ×1764)
-      → Conv1d → tanh → 波形
     """
-
-    def __init__(self, cfg: DecoderConfig):
+    def __init__(self, cfg: DecoderConfig, speaker_dim: int = 192):
         super().__init__()
         self.cfg = cfg
 
         latent_dim = cfg.latent_dim
-        speaker_dim = 192  # 話者エンコーダ出力に一致
 
         # 入力FiLM
         self.film_in = FiLM(latent_dim, speaker_dim)
