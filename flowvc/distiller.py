@@ -1,27 +1,27 @@
 """
-WavLM SSL distillation teacher for FlowVC Phase 0.
+WavLM direct feature matching for FlowVC Phase 0.
 
-Frozen WavLM-large provides target features. Encoder learns to predict
-these features via a lightweight projection head, preventing collapse.
+Encoder output is matched directly to WavLM features (no decoder, no learnable
+projection). Fixed random projection maps WavLM 1024-dim → 768-dim.
 
-Ref: USAD 2.0 (arXiv:2606.06444), F³-Tokenizer (arXiv:2606.06357)
+This eliminates decoder compensation as a collapse mechanism.
 """
 
 from __future__ import annotations
-import torch, torch.nn as nn
+import torch, torch.nn as nn, torchaudio
+
+WAVLM_SR = 16000
 
 
-WAVLM_SR = 16000  # WavLM native sample rate
-
-
-class WavLMDistiller(nn.Module):
+class WavLMDirectDistiller(nn.Module):
     """
-    Frozen WavLM teacher + learnable projection head.
+    Encoder → WavLM direct feature matching.
 
-    encoder(audio) → latent (768-dim)
-    latent → proj_head → pred (1024-dim)
-    WavLM(audio) → target (1024-dim)
-    loss = MSE(pred, target.detach()) + (1 - cos_sim(pred, target))
+    encoder(audio) → z (B, T, 768) @ 25Hz
+    WavLM(audio) → feats (B, T_wlm, 1024) @ ~50Hz
+    feats → fixed_proj → target (B, T_wlm, 768) @ ~50Hz
+    z → upsample 25→50Hz → pred (B, T_wlm, 768)
+    loss = MSE(pred, target)
     """
 
     def __init__(self, encoder: nn.Module, device: str = "cpu"):
@@ -29,28 +29,21 @@ class WavLMDistiller(nn.Module):
         self.encoder = encoder
         self.device = device
 
-        # Projection head: 768 → 1024 (WavLM-large hidden dim)
-        self.proj = nn.Sequential(
-            nn.Linear(768, 1024),
-            nn.LayerNorm(1024),
-            nn.GELU(),
-            nn.Linear(1024, 1024),
-        )
+        # Fixed random projection: 1024 → 768 (non-learnable, prevents memorization)
+        proj = torch.randn(1024, 768) * 0.01
+        self.register_buffer("fixed_proj", proj)
 
     def _ensure_wavlm(self):
         if not hasattr(self, "_wavlm"):
-            try:
-                from transformers import WavLMModel
-                self._wavlm = WavLMModel.from_pretrained("microsoft/wavlm-large")
-                self._wavlm.eval()
-                for p in self._wavlm.parameters():
-                    p.requires_grad = False
-            except ImportError:
-                raise ImportError("transformers required: pip install transformers")
+            from transformers import WavLMModel
+            self._wavlm = WavLMModel.from_pretrained("microsoft/wavlm-large")
+            self._wavlm.eval()
+            for p in self._wavlm.parameters():
+                p.requires_grad = False
 
     @torch.no_grad()
-    def _get_wavlm_target(self, wav: torch.Tensor, orig_sr: int) -> torch.Tensor:
-        """Extract WavLM features at ~25Hz frame rate."""
+    def _wavlm_features(self, wav: torch.Tensor, orig_sr: int) -> torch.Tensor:
+        """WavLM features → fixed projection → (B, T, 768) @ ~50Hz."""
         self._ensure_wavlm()
 
         if orig_sr != WAVLM_SR:
@@ -58,40 +51,35 @@ class WavLMDistiller(nn.Module):
 
         wav = wav.to(self._wavlm.device)
         out = self._wavlm(wav.squeeze(1), output_hidden_states=True)
-        feats = out.last_hidden_state  # (B, T_wlm, 1024)
+        feats = out.last_hidden_state  # (B, T, 1024)
 
-        # Resample from WavLM frame rate (~50Hz) to 25Hz via temporal pooling
-        B, T_wlm, D = feats.shape
-        T_out = T_wlm // 2  # 50Hz → 25Hz
-        feats = feats[:, :T_out * 2, :].reshape(B, T_out, 2, D).mean(dim=2)  # (B, T_out, 1024)
-        return feats
+        # Fixed projection to 768-dim
+        target = feats @ self.fixed_proj.to(feats.device)  # (B, T, 768)
+        return target
 
     def forward(self, src_wav: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            latent: (B, T, 768) encoder output @ 25Hz
-            loss: frame-level distillation loss
+            z: (B, T_enc, 768) encoder output @ 25Hz
+            loss: direct MSE matching loss
         """
-        z = self.encoder(src_wav, training=True)  # (B, T_lat, 768)
+        z = self.encoder(src_wav, training=True)  # (B, T_enc, 768) @ 25Hz
 
-        # Predict WavLM features per frame
-        pred = self.proj(z)  # (B, T_lat, 1024)
+        # WavLM target @ ~50Hz
+        target = self._wavlm_features(src_wav, 44100)  # (B, T_wlm, 768)
+        target = target.to(z.device)
 
-        # WavLM target at matching frame rate
-        target = self._get_wavlm_target(src_wav, 44100)
-        target = target.to(pred.device)
+        # Upsample encoder output 25→50Hz via repeat-interleave
+        z_up = z.repeat_interleave(2, dim=1)  # (B, T_enc*2, 768)
 
-        # Align frame counts
-        n = min(pred.size(1), target.size(1))
-        pred, target = pred[:, :n, :], target[:, :n, :]
+        # Align lengths
+        n = min(z_up.size(1), target.size(1))
+        z_up, target = z_up[:, :n, :], target[:, :n, :]
 
-        # MSE + cosine loss per frame
-        mse = nn.functional.mse_loss(pred, target)
-        cos = 1 - nn.functional.cosine_similarity(
-            pred.reshape(-1, 1024), target.reshape(-1, 1024), dim=-1
-        ).mean()
+        # Direct MSE (no learnable projection — encoder must match raw features)
+        mse = nn.functional.mse_loss(z_up, target)
 
-        return z, mse + 0.1 * cos
+        # Anti-collapse: per-channel temporal variance
+        var_loss = torch.relu(0.5 - z.var(dim=1).mean())
 
-
-import torchaudio
+        return z, mse + 0.1 * var_loss
