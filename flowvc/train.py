@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse, os, time, torch, torch.nn as nn, torch.nn.functional as F
 from .audiodec import AudioDecEncoder, AudioDecDecoder, AUDIODEC_DIM, AUDIODEC_SR
 from .converter import make_vector_field_net, solve_cfm_euler
-from .speaker import make_speaker_encoder
+from .ecapa import ECAPASpeakerEncoder  # pretrained ECAPA-TDNN
 from .prosody import make_prosody_extractor
 from .cfm_loss import CFMLoss
 from .dataset import VCTKDataset, create_dataloader
@@ -63,7 +63,11 @@ def train(args):
         dilations=(1, 2, 4, 8, 1, 2, 4, 8),
     ).to(device)
 
-    speaker_enc = make_speaker_encoder().to(device)
+    # ECAPA speaker encoder (pretrained, frozen)
+    speaker_enc = ECAPASpeakerEncoder(device=str(device)).to(device)
+    speaker_enc.eval()
+    for p in speaker_enc.parameters():
+        p.requires_grad = False
     prosody = make_prosody_extractor(device=str(device)).to(device)
 
     cfm_loss = CFMLoss(sigma_min=0.001)
@@ -80,16 +84,15 @@ def train(args):
         opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.98))
         model_dict = {"vfn": vfn, "speaker_enc": speaker_enc, "prosody": prosody}
 
-    # ── Phase 2: E2E (decoder + VFN) ──
+    # ── Phase 2: E2E (VFN only, decoder frozen, audio-domain loss) ──
     else:
-        speaker_enc.eval()
-        prosody.eval()
-        for m in [speaker_enc, prosody]:
+        decoder.eval()
+        for m in [decoder, speaker_enc, prosody]:
             for p in m.parameters():
                 p.requires_grad = False
-        params = list(decoder.parameters()) + list(vfn.parameters())
+        params = list(vfn.parameters())
         opt = torch.optim.AdamW(params, lr=args.lr * 0.1, betas=(0.9, 0.98))
-        model_dict = {"vfn": vfn, "decoder": decoder, "speaker_enc": speaker_enc, "prosody": prosody}
+        model_dict = {"vfn": vfn}
 
     # ── resume ──
     start_step = 0
