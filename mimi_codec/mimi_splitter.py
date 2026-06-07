@@ -77,6 +77,6 @@ class KanadeSplitterV4(nn.Module):
 
     def forward(self, x):
         f_shallow, f_deep, z_full = self.extractor(x)
-        z_content = self.content_bn(f_deep)
-        z_spk = self.speaker_enc(f_shallow)
+        z_content = self.content_bn(f_shallow)  # shallow → content (c_cos=0.996)
+        z_spk = self.speaker_enc(f_deep)        # deep → speaker
         return z_content, z_spk, z_full
