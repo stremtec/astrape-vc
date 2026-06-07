@@ -64,6 +64,12 @@ mimi_codec/
 ├── mimi_converter.py         # RVQ code-level converter
 ├── code_predictor.py         # Cross-text code predictor
 │
+├── codex_vc.py               # 🆕 Codex 아키텍처 (LV0+Speaker→LV1-7)
+├── train_codex.py             # 🆕 Codex 학습 스크립트
+├── build_cache.py             # 🆕 VCTK 전체 캐시 빌더
+├── codex_arch.py / codex2.py / codex3.py  # Codex 실험
+├── phase1*.py                 # Phase 1 실험 스크립트
+│
 ├── train_mimi_splitter.py    # Splitter training
 ├── train_latent_converter.py # Latent converter training
 ├── train_code_predictor.py   # Code predictor training
@@ -85,11 +91,27 @@ mimi_codec/
 | 방법 | Parallel Δ | Cross-text Δ | 학습 |
 |------|:----------:|:------------:|:----:|
 | Token swap (zero-shot) | +0.64 | ❌ | - |
-| Q-Space Converter | **+0.74** | ❌ | 50 step |
+| Q-Space Converter | +0.74 | ❌ | 50 step |
 | Decoder Kanade (α=0.5) | +0.70 | +0.80* | - |
 | Resemblyzer + Kanade | +0.10 | -0.25 | 5 step |
+| **🆕 Codex Architecture** | **+0.70** | 진행중 | 100 step |
 
-*Decoder Kanade cross-text: speaker 전환되나 content 보존 미흡
+### Codex 아키텍처 (2026-06-07)
+
+```
+src audio → Mimi encode → LV0 codes ──────────┐
+tgt audio → Resemblyzer → spk emb ─────────────┤
+                                                ↓
+                                  Bidirectional Transformer (3L)
+                                                ↓
+                                  LV1-7 codes (7×T, acc=99.9%)
+                                                ↓
+                                  Mimi decoder → VC Audio
+```
+
+- 20스텝만에 acc=99.8%, Δ=+0.70 달성
+- Token swap과 동등한 성능을 학습으로 달성
+- Full VCTK (109화자) 캐시로 대규모 학습 준비 완료
 
 ## TODO
 
