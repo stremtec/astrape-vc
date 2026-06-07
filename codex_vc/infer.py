@@ -89,10 +89,16 @@ def main():
     for p in mimi.parameters():
         p.requires_grad_(False)
 
-    # Load model
+    # Load model (backward-compatible: plain state_dict or checkpoint dict)
     print("Loading model...")
     model = CodeGenerator()
-    model.load_state_dict(torch.load(args.model, weights_only=True))
+    ckpt = torch.load(args.model, weights_only=True)
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        model.load_state_dict(ckpt["model"])
+        print(f"  Loaded checkpoint (step={ckpt.get('step','?')}, "
+              f"best_val_acc={ckpt.get('best_val_acc','?')})")
+    else:
+        model.load_state_dict(ckpt)
     model.eval()
 
     # Load speaker embedding
