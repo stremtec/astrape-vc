@@ -58,9 +58,12 @@ def cache_mimi_latents(data_dir: str, cache_dir: str, device: str = "cpu", max_p
             with torch.no_grad():
                 z = mimi.encode_to_latent(x, quantize=False).cpu()  # (1, 512, T)
 
+            # Extract utterance base from filename: p225_001_mic1 → p225_001
+            utt_base = f.stem.rsplit("_", 1)[0] if "_mic" in f.stem else f.stem
+
             out_path = Path(cache_dir) / spk_id / f"{f.stem}.pt"
-            torch.save({"z": z.squeeze(0), "speaker": spk_id}, out_path)
-            index.append({"path": str(out_path.relative_to(cache_dir)), "speaker": spk_id})
+            torch.save({"z": z.squeeze(0), "speaker": spk_id, "utterance_id": utt_base}, out_path)
+            index.append({"path": str(out_path.relative_to(cache_dir)), "speaker": spk_id, "utterance_id": utt_base})
 
         print(f"  {spk_id}: {len(files)} files")
 
