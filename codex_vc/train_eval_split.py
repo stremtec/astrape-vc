@@ -353,8 +353,8 @@ def main():
 
         # Log
         if log_file:
-            log_file.write(json.dumps(metrics) + "\
-")
+            log_file.write(json.dumps(metrics))
+            log_file.write(chr(10))  # newline
             log_file.flush()
 
     print()
