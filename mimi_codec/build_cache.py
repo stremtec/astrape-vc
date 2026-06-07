@@ -56,7 +56,7 @@ for i, s in enumerate(all_spks):
         try:
             a = load_any(f'{base}/{s}/{u}')
             codes = mimi.encode(a)
-            cache[(s,u.replace('.flac',''))] = codes.cpu()
+            cache[(s,u.split('_')[1])]=codes.cpu()
         except: pass
     if (i+1) % 10 == 0:
         print(f'  Codes: {len(cache)} entries ({i+1}/{len(all_spks)} speakers) [{time.time()-t0:.0f}s]')
