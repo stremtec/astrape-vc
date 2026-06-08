@@ -44,16 +44,18 @@ class ContentProjector(nn.Module):
     """HuBERT content (768-dim @ 50Hz) → Mimi latent (512-dim @ 12.5Hz)."""
     def __init__(self, in_dim=768, out_dim=512):
         super().__init__()
-        # Bottleneck: reduce speaker info
+        # Bottleneck with more capacity
         self.bottleneck = nn.Sequential(
-            nn.Conv1d(in_dim, 256, 1),
-            nn.GELU(),
-            nn.Conv1d(256, in_dim, 1),
+            nn.Conv1d(in_dim, 384, 1), nn.GELU(),
+            nn.Conv1d(384, 128, 1), nn.GELU(),  # Strong bottleneck
+            nn.Conv1d(128, 384, 1), nn.GELU(),
+            nn.Conv1d(384, in_dim, 1),
         )
-        # Downsample 50Hz → 12.5Hz (4x)
+        # Downsample with more layers
         self.downsample = nn.Sequential(
-            nn.Conv1d(in_dim, 512, 4, stride=2, padding=1), nn.GELU(),
-            nn.Conv1d(512, out_dim, 4, stride=2, padding=1),
+            nn.Conv1d(in_dim, 512, 5, stride=2, padding=2), nn.GELU(),
+            nn.Conv1d(512, 512, 5, stride=2, padding=2), nn.GELU(),
+            nn.Conv1d(512, out_dim, 3, padding=1),
         )
     
     def forward(self, hubert_feat):
@@ -88,16 +90,19 @@ class StreamVC(nn.Module):
         tgt_spk_emb: (B, spk_dim) target speaker
         Returns: z_q_vc (B, 512, T_mimi) decoder-compatible latent
         """
-        # Extract HuBERT layer 0 features
+        # Extract HuBERT layers 1-3 average (all 0% speaker leakage!)
         with torch.no_grad():
             hubert_out = self.hubert(src_audio_16k, output_hidden_states=True)
-            h0 = hubert_out.hidden_states[0]  # (B, T_h, 768)
+            h1 = hubert_out.hidden_states[1]
+            h2 = hubert_out.hidden_states[2]
+            h3 = hubert_out.hidden_states[3]
+            h_avg = (h1 + h2 + h3) / 3.0
         
         # Adversarial speaker removal (training only)
-        _ = self.spk_adversarial(h0.transpose(1, 2))
+        _ = self.spk_adversarial(h_avg.transpose(1, 2))
         
         # Project to Mimi latent space
-        z_content = self.content_proj(h0)  # (B, 512, T_mimi)
+        z_content = self.content_proj(h_avg)  # (B, 512, T_mimi)
         
         # Inject target speaker
         gamma = self.spk_gamma(tgt_spk_emb).unsqueeze(-1)
