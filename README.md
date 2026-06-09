@@ -3,6 +3,8 @@
 
 STILL WORKING!!!
 
+The architecture may change at any time, but the overall direction will not change.
+
 > **Αστραπή** (アストラペー) — ギリシャ語で「稲妻」
 
 Conditional Flow Matching によるリアルタイムニューラル音声変換。  
