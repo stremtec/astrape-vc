@@ -6,7 +6,7 @@ Target: teacher content embedding + decoder mel consistency.
 import torch, torch.nn as nn, torch.nn.functional as F, numpy as np, os, time, math
 from torch.optim import AdamW; from torch.optim.lr_scheduler import CosineAnnealingLR
 
-BATCH=4; EPOCHS=120; device='cpu'
+BATCH=4; EPOCHS=100; device='cpu'
 
 # ── Models ──────────────────────────────────────────────────────────────
 class PositionalEncoding(nn.Module):
@@ -86,27 +86,14 @@ def load(idx):
     return (torch.from_numpy(md['logmel']).float(),torch.from_numpy(od['ce_768']).float(),
             torch.from_numpy(od['pre_fsq_768']).float(),torch.from_numpy(od['ge_128']).float())
 
-# ── Teacher mels for decoder-aware loss ─────────────────────────────────
-import torchaudio
-mel_ext=torchaudio.transforms.MelSpectrogram(sample_rate=44100,n_fft=1024,hop_length=1764,n_mels=80,f_min=80,f_max=14000,center=False,power=1)
+# ── Teacher mels: skip for v3-fast (data volume priority) ──────────────
 teacher_mels={}
+decoder=None
 
-print("Precomputing teacher mels (decoder-aware target)...")
-for i in tr[::2]:  # every 2nd sample for speed
-    od=np.load(f"{OUT_DIR}/sample_{i:05d}.npz")
-    audio=od['audio']; w=audio-np.mean(audio)
-    mel=mel_ext(torch.from_numpy(w).float().view(1,1,-1))
-    teacher_mels[i]=torch.log(mel.squeeze(1).clamp(min=1e-5)).squeeze(0)
-print("  {} teacher mels".format(len(teacher_mels)))
-
-# ── Models ──────────────────────────────────────────────────────────────
+# ── Model ──────────────────────────────────────────────────────────────
 model=ContentStudentV3().to(device); model.train()
-# Start from v2-FINAL
 try: model.load_state_dict(torch.load("checkpoints/causal_student_v2_final.pt",map_location='cpu'),strict=False)
 except: pass
-
-decoder=CausalMelDecoder(); decoder.load_state_dict(torch.load("checkpoints/causal_mel_decoder.pt",map_location='cpu')); decoder.eval()
-for p in decoder.parameters(): p.requires_grad=False
 
 opt=AdamW(model.parameters(),lr=3e-4,weight_decay=1e-5); sched=CosineAnnealingLR(opt,T_max=EPOCHS)
 print("Params:",sum(p.numel() for p in model.parameters()),"| Training v3...")
@@ -138,16 +125,8 @@ for epoch in range(EPOCHS):
         cos_pf=F.cosine_similarity(pp.reshape(pp.shape[0],-1),pt.reshape(pt.shape[0],-1),dim=1).mean()
         L_pf=(1-cos_pf)*0.3
         
-        # Decoder-aware loss: student content → decoder → mel vs teacher mel
+        # Decoder-aware loss: SKIP for speed — data volume is the priority
         L_dec=0
-        if mel_tgts:
-            mel_pred=decoder(ep.transpose(1,2),ge_b)
-            for j,(idx,mt) in enumerate(mel_tgts):
-                if j>=mel_pred.shape[0]: break
-                mt_dev=mt.unsqueeze(0).to(device)
-                Tmp=min(mel_pred.shape[2],mt_dev.shape[2])
-                L_dec+=F.l1_loss(mel_pred[j:j+1,:,:Tmp],mt_dev[:,:,:Tmp])
-            L_dec=L_dec/max(len(mel_tgts),1)*0.1
         
         loss=L_ce+L_pf+L_dec
         opt.zero_grad(); loss.backward()
