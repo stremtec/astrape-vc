@@ -1,5 +1,8 @@
 # Astrape VC 
 
+
+STILL WORKING!!!
+
 > **Αστραπή** (アストラペー) — ギリシャ語で「稲妻」
 
 Conditional Flow Matching によるリアルタイムニューラル音声変換。  
