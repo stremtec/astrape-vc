@@ -1,1 +1,0 @@
-{"n_blocks": 8, "use_cross_attn": false, "dilations": [1,2,4,8,1,2,4,8], "content_dim": 768, "speaker_dim": 128, "backend": "mio"}
