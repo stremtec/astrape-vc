@@ -8,6 +8,12 @@ import torch
 
 from astrape.audio import StreamingLogMel
 from astrape.checkpoint import load_content_checkpoint, save_checkpoint
+from astrape.curriculum import (
+    CurriculumConfig,
+    original_loss,
+    phase_weights,
+    validate_curriculum,
+)
 from astrape.data import (
     ContentSample,
     crop_aligned,
@@ -16,6 +22,13 @@ from astrape.data import (
 )
 from astrape.mel_decoder import CausalMelDecoder, MelDecoderConfig, load_mel_decoder
 from astrape.model import ContentStudent, ContentStudentConfig
+from astrape.fsq import (
+    fit_fsq_projection,
+    indices_to_codes,
+    indices_to_level_indices,
+)
+from astrape.original_data import OriginalBatch, minimum_ctc_frames
+from astrape.text import VOCAB_SIZE
 from tiers import TIERS, get_tier
 
 
@@ -137,7 +150,7 @@ class CoreTests(unittest.TestCase):
     def test_crop_uses_even_grid_and_includes_last_window(self):
         mel = torch.arange(20).repeat(80, 1).float()
         content = torch.arange(10).unsqueeze(1).repeat(1, 4).float()
-        sample = ContentSample(mel, content, content.clone(), "p001", 0)
+        sample = ContentSample(mel, content, content.clone(), None, "p001", 0)
 
         class LastChoice(random.Random):
             def choice(self, sequence):
@@ -198,6 +211,138 @@ class CoreTests(unittest.TestCase):
             )
             loaded = load_mel_decoder(path)
             self.assertEqual(loaded.config.hidden, 64)
+
+    def test_structured_fsq_output_matches_frozen_projection(self):
+        config = ContentStudentConfig(
+            hidden=64,
+            n_layers=2,
+            n_heads=4,
+            content_dim=16,
+            structured_fsq=True,
+            text_vocab_size=VOCAB_SIZE,
+        )
+        model = ContentStudent(config).eval()
+        projection = {
+            "weight": torch.randn(16, 5),
+            "bias": torch.randn(16),
+        }
+        model.load_fsq_projection(projection)
+        output = model(torch.randn(1, 80, 20))
+        self.assertIsNotNone(output.fsq_codes)
+        codes = []
+        for axis, levels in enumerate(config.fsq_levels):
+            values = (
+                output.fsq_codes[:, :, axis].float() - levels // 2
+            ) / (levels // 2)
+            codes.append(values)
+        codes = torch.stack(codes, dim=-1)
+        expected = torch.nn.functional.linear(
+            codes, projection["weight"], projection["bias"]
+        ).transpose(1, 2)
+        torch.testing.assert_close(output.content, expected)
+
+    def test_fsq_index_roundtrip_targets(self):
+        indices = torch.tensor([[0, 930, 12799]])
+        levels = indices_to_level_indices(indices)
+        codes = indices_to_codes(indices)
+        self.assertEqual(tuple(levels.shape), (1, 3, 5))
+        self.assertEqual(tuple(codes.shape), (1, 3, 5))
+        self.assertTrue(torch.equal(levels[0, 0], torch.zeros(5, dtype=torch.long)))
+
+    def test_fsq_projection_fit_recovers_affine_teacher(self):
+        indices = torch.arange(12800)
+        codes = indices_to_codes(indices)
+        weight = torch.randn(16, 5)
+        bias = torch.randn(16)
+        embeddings = torch.nn.functional.linear(codes, weight, bias)
+        fitted = fit_fsq_projection(indices, embeddings)
+        torch.testing.assert_close(fitted["weight"], weight, atol=2e-6, rtol=2e-6)
+        torch.testing.assert_close(fitted["bias"], bias, atol=2e-6, rtol=2e-6)
+
+    def test_structured_fsq_streaming_matches_full_sequence(self):
+        model = ContentStudent(
+            ContentStudentConfig(
+                hidden=64,
+                n_layers=2,
+                n_heads=4,
+                content_dim=16,
+                structured_fsq=True,
+                max_attention_context=8,
+            )
+        ).eval()
+        model.load_fsq_projection(
+            {"weight": torch.randn(16, 5), "bias": torch.randn(16)}
+        )
+        x = torch.randn(1, 80, 20)
+        expected = model(x).content
+        state = None
+        chunks = []
+        for start in range(0, x.shape[-1], 2):
+            output, state = model.forward_stream(x[:, :, start : start + 2], state)
+            chunks.append(output.content)
+        torch.testing.assert_close(
+            torch.cat(chunks, dim=-1), expected, atol=2e-6, rtol=2e-6
+        )
+
+    def test_ctc_minimum_frames_accounts_for_repeated_labels(self):
+        self.assertEqual(minimum_ctc_frames(torch.tensor([1, 1, 2, 2, 2])), 8)
+
+    def test_curriculum_phase_schedule(self):
+        config = CurriculumConfig(
+            data_dir=Path("."),
+            mel_dir=Path("."),
+            audio_root=Path("."),
+            transcript_root=Path("."),
+            fsq_projection=Path("."),
+            output_dir=Path("."),
+            original_epochs=2,
+            blend_epochs=2,
+            teacher_epochs=2,
+        )
+        self.assertEqual(phase_weights(0, config)[0], "original")
+        self.assertEqual(phase_weights(2, config)[0], "blend")
+        self.assertEqual(phase_weights(4, config)[0], "teacher")
+        validate_curriculum(config)
+
+    def test_curriculum_rejects_odd_teacher_crop(self):
+        config = CurriculumConfig(
+            data_dir=Path("."),
+            mel_dir=Path("."),
+            audio_root=Path("."),
+            transcript_root=Path("."),
+            fsq_projection=Path("."),
+            output_dir=Path("."),
+            max_teacher_mel_frames=79,
+        )
+        with self.assertRaises(ValueError):
+            validate_curriculum(config)
+
+    def test_original_ctc_loss_backpropagates(self):
+        model = ContentStudent(
+            ContentStudentConfig(
+                hidden=32,
+                n_layers=1,
+                n_heads=4,
+                content_dim=16,
+                structured_fsq=True,
+                text_vocab_size=VOCAB_SIZE,
+            )
+        )
+        batch = OriginalBatch(
+            mel=torch.randn(1, 80, 12),
+            input_lengths=torch.tensor([12]),
+            transcripts=torch.tensor([1, 2, 3]),
+            transcript_lengths=torch.tensor([3]),
+        )
+        loss = original_loss(
+            model,
+            batch,
+            torch.device("cpu"),
+            torch.nn.CTCLoss(blank=0, zero_infinity=True),
+        )
+        loss.backward()
+        self.assertIsNotNone(model.text_head.weight.grad)
+        self.assertGreater(model.text_head.weight.grad.abs().sum().item(), 0.0)
 
     def test_all_tiers_construct(self):
         for name in TIERS:

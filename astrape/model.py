@@ -20,6 +20,9 @@ class ContentStudentConfig:
     content_dim: int = 768
     dropout: float = 0.0
     auxiliary_prefsq: bool = False
+    structured_fsq: bool = False
+    fsq_levels: tuple[int, ...] = (8, 8, 8, 5, 5)
+    text_vocab_size: int = 0
     safe_convs: bool = False
     max_attention_context: Optional[int] = None
 
@@ -28,6 +31,10 @@ class ContentStudentConfig:
 class ContentStudentOutput:
     content: torch.Tensor
     pre_fsq: Optional[torch.Tensor] = None
+    hard_content: Optional[torch.Tensor] = None
+    fsq_logits: Optional[tuple[torch.Tensor, ...]] = None
+    fsq_codes: Optional[torch.Tensor] = None
+    text_logits: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -233,6 +240,14 @@ class ContentStudent(nn.Module):
 
     def __init__(self, config: ContentStudentConfig):
         super().__init__()
+        if config.hidden % config.n_heads:
+            raise ValueError("hidden must be divisible by n_heads")
+        if config.max_attention_context is not None and config.max_attention_context <= 0:
+            raise ValueError("max_attention_context must be positive")
+        if config.structured_fsq and (
+            not config.fsq_levels or any(level < 2 for level in config.fsq_levels)
+        ):
+            raise ValueError("structured FSQ levels must all be at least two")
         self.config = config
         conv_type = SafeCausalConv1d if config.safe_convs else CausalConv1d
         self.stem = nn.Sequential(
@@ -247,12 +262,77 @@ class ContentStudent(nn.Module):
         )
         self.norm = nn.LayerNorm(config.hidden)
         self.down = conv_type(config.hidden, config.hidden, 3, stride=2)
-        self.content_head = conv_type(config.hidden, config.content_dim, 1)
+        self.content_head = (
+            None
+            if config.structured_fsq
+            else conv_type(config.hidden, config.content_dim, 1)
+        )
+        self.fsq_head = (
+            conv_type(config.hidden, sum(config.fsq_levels), 1)
+            if config.structured_fsq
+            else None
+        )
+        self.fsq_projection = (
+            nn.Linear(len(config.fsq_levels), config.content_dim)
+            if config.structured_fsq
+            else None
+        )
+        if self.fsq_projection is not None:
+            self.fsq_projection.requires_grad_(False)
+        self.text_head = (
+            nn.Linear(config.hidden, config.text_vocab_size)
+            if config.text_vocab_size > 0
+            else None
+        )
         self.prefsq_head = (
             conv_type(config.hidden, config.content_dim, 1)
             if config.auxiliary_prefsq
             else None
         )
+
+    def load_fsq_projection(self, state: dict[str, torch.Tensor]) -> None:
+        if self.fsq_projection is None:
+            raise RuntimeError("Model does not use a structured FSQ head")
+        self.fsq_projection.load_state_dict(state, strict=True)
+        self.fsq_projection.requires_grad_(False)
+
+    def _decode_fsq(
+        self, hidden: torch.Tensor
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        tuple[torch.Tensor, ...],
+        torch.Tensor,
+    ]:
+        if self.fsq_head is None or self.fsq_projection is None:
+            raise RuntimeError("Structured FSQ head is not configured")
+        packed_logits = self.fsq_head(hidden)
+        logits = torch.split(packed_logits, self.config.fsq_levels, dim=1)
+        soft_codes = []
+        hard_codes = []
+        level_indices = []
+        for axis_logits, levels in zip(logits, self.config.fsq_levels):
+            values = (
+                torch.arange(levels, device=hidden.device, dtype=hidden.dtype)
+                - levels // 2
+            ) / (levels // 2)
+            indices = axis_logits.argmax(dim=1)
+            level_indices.append(indices)
+            hard_codes.append(values[indices])
+            if self.training:
+                probabilities = torch.softmax(axis_logits, dim=1)
+                soft_codes.append(
+                    torch.sum(probabilities * values.view(1, -1, 1), dim=1)
+                )
+        hard_code = torch.stack(hard_codes, dim=-1)
+        hard_content = self.fsq_projection(hard_code).transpose(1, 2)
+        if self.training:
+            soft_code = torch.stack(soft_codes, dim=-1)
+            soft_content = self.fsq_projection(soft_code).transpose(1, 2)
+        else:
+            soft_content = hard_content
+        indices = torch.stack(level_indices, dim=-1)
+        return soft_content, hard_content, logits, indices
 
     @staticmethod
     def output_lengths(input_lengths: torch.Tensor) -> torch.Tensor:
@@ -269,11 +349,26 @@ class ContentStudent(nn.Module):
             padding_mask = positions.unsqueeze(0) >= lengths.unsqueeze(1)
         for block in self.blocks:
             h = block(h, padding_mask)
-        h = self.norm(h).transpose(1, 2)
-        h = self.down(h)
-        content = self.content_head(h)
+        h = self.norm(h)
+        text_logits = self.text_head(h) if self.text_head is not None else None
+        h = self.down(h.transpose(1, 2))
+        hard_content = None
+        fsq_logits = None
+        fsq_codes = None
+        if self.fsq_head is not None:
+            soft_content, hard_content, fsq_logits, fsq_codes = self._decode_fsq(h)
+            content = soft_content if self.training else hard_content
+        else:
+            content = self.content_head(h)
         pre_fsq = self.prefsq_head(h) if self.prefsq_head is not None else None
-        return ContentStudentOutput(content=content, pre_fsq=pre_fsq)
+        return ContentStudentOutput(
+            content=content,
+            pre_fsq=pre_fsq,
+            hard_content=hard_content,
+            fsq_logits=fsq_logits,
+            fsq_codes=fsq_codes,
+            text_logits=text_logits,
+        )
 
     def initial_streaming_state(self) -> StreamingState:
         return StreamingState(
@@ -303,8 +398,7 @@ class ContentStudent(nn.Module):
             if flush:
                 state.pending_mel = None
             empty = x.new_empty(x.shape[0], self.config.content_dim, 0)
-            pre_fsq = empty if self.prefsq_head is not None else None
-            return ContentStudentOutput(content=empty, pre_fsq=pre_fsq), state
+            return ContentStudentOutput(content=empty), state
         h, state.stem_caches[0] = self.stem[0].forward_stream(
             x, state.stem_caches[0]
         )
@@ -320,11 +414,29 @@ class ContentStudent(nn.Module):
                 state.block_histories[index],
                 self.config.max_attention_context,
             )
-        h = self.norm(h).transpose(1, 2)
-        h, state.down_cache = self.down.forward_stream(h, state.down_cache)
-        content = self.content_head(h)
-        pre_fsq = self.prefsq_head(h) if self.prefsq_head is not None else None
+        h = self.norm(h)
+        h, state.down_cache = self.down.forward_stream(
+            h.transpose(1, 2), state.down_cache
+        )
+        hard_content = None
+        fsq_logits = None
+        fsq_codes = None
+        if self.fsq_head is not None:
+            _, hard_content, fsq_logits, fsq_codes = self._decode_fsq(h)
+            content = hard_content
+        else:
+            content = self.content_head(h)
         state.position += x.shape[-1]
         if flush:
             state.pending_mel = None
-        return ContentStudentOutput(content=content, pre_fsq=pre_fsq), state
+        return (
+            ContentStudentOutput(
+                content=content,
+                pre_fsq=None,
+                hard_content=hard_content,
+                fsq_logits=fsq_logits,
+                fsq_codes=fsq_codes,
+                text_logits=None,
+            ),
+            state,
+        )

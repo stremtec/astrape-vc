@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -17,7 +17,7 @@ class MelDecoderConfig:
     ff_mult: int = 4
     n_mels: int = 80
     dropout: float = 0.1
-    max_attention_context: Optional[int] = None
+    max_attention_context: Optional[int] = 50
 
 
 @dataclass
@@ -175,11 +175,17 @@ class CausalMelDecoder(nn.Module):
         return mel, state
 
 
-def load_mel_decoder(path: str, device: torch.device | str = "cpu") -> CausalMelDecoder:
+def load_mel_decoder(
+    path: str,
+    device: torch.device | str = "cpu",
+    max_attention_context: Optional[int] = None,
+) -> CausalMelDecoder:
     payload = torch.load(path, map_location=device)
     state = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
     config_data = payload.get("config", {}) if isinstance(payload, dict) else {}
     config = MelDecoderConfig(**config_data) if config_data else MelDecoderConfig()
+    if max_attention_context is not None:
+        config = replace(config, max_attention_context=max_attention_context)
     model = CausalMelDecoder(config).to(device)
     model.load_state_dict(state, strict=True)
     return model

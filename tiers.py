@@ -27,6 +27,12 @@ TIERS = {
         epochs=30,
         label="medium (768dim)",
     ),
+    "quality": Tier(
+        model=ContentStudentConfig(hidden=768, n_layers=10, n_heads=12),
+        learning_rate=2e-4,
+        epochs=45,
+        label="quality (768dim x 10)",
+    ),
     "xhigh": Tier(
         model=ContentStudentConfig(
             hidden=1024,

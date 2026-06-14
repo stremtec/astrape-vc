@@ -8,8 +8,9 @@ MioCodec.
 ```text
 16 kHz source PCM
   -> streaming log-mel, 50 Hz
-  -> strictly causal ContentStudent
-  -> content embedding, 768d at 25 Hz
+  -> strictly causal 768x10 ContentStudent, 2 s bounded history
+  -> 5-axis FSQ prediction
+  -> frozen MioCodec 5d-to-768d projection, 25 Hz
   -> CausalMelDecoder + cached target global embedding, 128d
   -> mel, 80 bins at 25 Hz
 ```
@@ -22,7 +23,8 @@ decoder, while a production causal vocoder has not yet been trained.
 ## Models
 
 - `astrape.model.ContentStudent`: left-padded causal convolutions, causal
-  attention, aligned 50 Hz to 25 Hz downsampling, streaming state.
+  attention, aligned 50 Hz to 25 Hz downsampling, bounded streaming state,
+  and an FSQ-aware output head matching MioCodec's `[8,8,8,5,5]` code axes.
 - `astrape.mel_decoder.CausalMelDecoder`: source-restored AdaLN-Zero decoder
   matching `checkpoints/causal_mel_decoder.pt`.
 - `astrape.audio.StreamingLogMel`: exact `center=False` full/chunked log-mel
@@ -45,6 +47,15 @@ new causal architecture before reporting causal quality.
 # Configured capacity tier
 .venv/bin/python train_xhigh.py --tier xhigh --device mps
 
+# Recover the teacher's exact frozen 5d-to-768d projection from cached labels
+.venv/bin/python extract_fsq_projection.py
+
+# Original VCTK CTC -> gradual blend -> MioCodec FSQ distillation
+.venv/bin/python train_content_curriculum.py \
+  --audio-root /path/to/VCTK/wav48_silence_trimmed \
+  --transcript-root /path/to/VCTK/txt \
+  --device mps
+
 # Causal mel decoder
 .venv/bin/python train_mel_decoder.py --target-mode teacher
 ```
@@ -52,6 +63,18 @@ new causal architecture before reporting causal quality.
 Training uses speaker-disjoint validation, aligned even-frame crops, masked
 variable-length losses, deterministic seeds, full validation, versioned
 checkpoints, and separate `.best.pt`/`.last.pt` files.
+
+The curriculum keeps validation speakers out of both original and teacher
+training. Its phases are:
+
+1. Full original VCTK utterances with a character CTC objective.
+2. A gradual mixture of original CTC and MioCodec teacher supervision.
+3. 90% teacher FSQ distillation with 10% original-data retention.
+
+Teacher training predicts the five discrete FSQ axes directly. Exact axes
+reconstruct cached `ce_768` through the frozen teacher projection, so the
+deployment metric is hard-code teacher cosine rather than similarity to the
+source audio. The configured target is `0.99`.
 
 To import the historical student weights:
 
@@ -93,12 +116,21 @@ Benchmark timings synchronize MPS/CUDA before and after every measurement and
 report full-sequence latency, streaming latency per 25 Hz content frame, and
 real-time factor.
 
+On the current Apple MPS host, the selected 768x10 model with 100 past
+50 Hz frames measured 29.3 ms p50 and 30.5 ms p95 per output frame after
+cache saturation.
+Content plus the causal mel decoder measured 32.4 ms p50 and 33.0 ms p95.
+Both caches are bounded and use no future lookahead. The first mel output still
+includes the causal STFT collection delay; waveform synthesis remains the
+unresolved production stage.
+
 ## Tests
 
 ```bash
 .venv/bin/python -m unittest discover -v
 ```
 
-The suite covers causal prefix invariance, streaming equivalence, log-mel
-streaming, speaker-disjoint splitting, crop alignment, padding masks,
+The suite covers causal prefix invariance, continuous and structured-FSQ
+streaming equivalence, log-mel streaming, speaker-disjoint splitting, crop
+alignment, CTC constraints, exact FSQ projection recovery, padding masks,
 checkpoint compatibility, decoder loading, and tier construction.

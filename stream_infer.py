@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("outputs/stream_result.npz"))
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--chunk-mel-frames", type=int, default=2)
+    parser.add_argument("--mel-attention-context-frames", type=int, default=50)
     parser.add_argument("--allow-legacy", action="store_true")
     return parser.parse_args()
 
@@ -32,7 +33,11 @@ def main() -> None:
     student, _ = load_content_checkpoint(
         args.checkpoint, device=device, allow_legacy=args.allow_legacy
     )
-    decoder = load_mel_decoder(args.mel_decoder, device)
+    decoder = load_mel_decoder(
+        args.mel_decoder,
+        device,
+        max_attention_context=args.mel_attention_context_frames,
+    )
     student.eval()
     decoder.eval()
     with np.load(args.mel) as data:

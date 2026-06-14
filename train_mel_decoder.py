@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--attention-context-frames", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -171,7 +172,9 @@ def main() -> None:
     train_indices, validation_indices = speaker_disjoint_split(speakers, 0.15, args.seed)
     build_target_cache(args, n_samples)
     device = torch.device(args.device)
-    model = CausalMelDecoder(MelDecoderConfig()).to(device)
+    model = CausalMelDecoder(
+        MelDecoderConfig(max_attention_context=args.attention_context_frames)
+    ).to(device)
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     best = float("inf")

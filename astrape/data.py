@@ -16,6 +16,7 @@ class ContentSample:
     mel: torch.Tensor
     content: torch.Tensor
     pre_fsq: Optional[torch.Tensor]
+    token_indices: Optional[torch.Tensor]
     speaker: str
     index: int
 
@@ -25,6 +26,7 @@ class ContentBatch:
     mel: torch.Tensor
     content: torch.Tensor
     pre_fsq: Optional[torch.Tensor]
+    token_indices: Optional[torch.Tensor]
     input_lengths: torch.Tensor
     target_lengths: torch.Tensor
     target_mask: torch.Tensor
@@ -62,10 +64,16 @@ class MioContentDataset(Dataset[ContentSample]):
                 if "pre_fsq_768" in output_data
                 else None
             )
+            token_indices = (
+                torch.from_numpy(output_data["ct"]).long()
+                if "ct" in output_data
+                else None
+            )
         return ContentSample(
             mel=mel,
             content=content,
             pre_fsq=pre_fsq,
+            token_indices=token_indices,
             speaker=self.speakers[index],
             index=index,
         )
@@ -75,9 +83,16 @@ def speaker_disjoint_split(
     speakers: Sequence[str], validation_fraction: float, seed: int
 ) -> tuple[np.ndarray, np.ndarray]:
     unique = np.array(sorted(set(map(str, speakers))))
+    if len(unique) < 2:
+        raise ValueError("Speaker-disjoint splitting requires at least two speakers")
+    if not 0 < validation_fraction < 1:
+        raise ValueError("validation_fraction must be between 0 and 1")
     rng = np.random.default_rng(seed)
     rng.shuffle(unique)
-    validation_count = max(1, round(len(unique) * validation_fraction))
+    validation_count = min(
+        len(unique) - 1,
+        max(1, round(len(unique) * validation_fraction)),
+    )
     validation_speakers = set(unique[:validation_count])
     train = np.array(
         [index for index, speaker in enumerate(speakers) if speaker not in validation_speakers]
@@ -108,6 +123,11 @@ def crop_aligned(
             if sample.pre_fsq is not None
             else None
         ),
+        token_indices=(
+            sample.token_indices[target_start : target_start + target_length]
+            if sample.token_indices is not None
+            else None
+        ),
         speaker=sample.speaker,
         index=sample.index,
     )
@@ -132,6 +152,9 @@ class ContentCollator:
                     sample.content.shape[0],
                     sample.pre_fsq.shape[0]
                     if sample.pre_fsq is not None
+                    else sample.content.shape[0],
+                    sample.token_indices.shape[0]
+                    if sample.token_indices is not None
                     else sample.content.shape[0],
                 )
                 for sample in samples
@@ -164,12 +187,25 @@ class ContentCollator:
                     for sample, length in zip(samples, target_lengths.tolist())
                 ]
             )
+        has_tokens = all(sample.token_indices is not None for sample in samples)
+        token_indices = None
+        if has_tokens:
+            token_indices = torch.stack(
+                [
+                    F.pad(
+                        sample.token_indices[:length],
+                        (0, max_target - length),
+                    )
+                    for sample, length in zip(samples, target_lengths.tolist())
+                ]
+            )
         positions = torch.arange(max_target)
         target_mask = positions.unsqueeze(0) < target_lengths.unsqueeze(1)
         return ContentBatch(
             mel=mel,
             content=content,
             pre_fsq=pre_fsq,
+            token_indices=token_indices,
             input_lengths=input_lengths,
             target_lengths=target_lengths,
             target_mask=target_mask,

@@ -1,6 +1,24 @@
 # MioCodec Content Student — Research Log
 
-> **Implementation note (2026-06-14):** The historical v3/v3-4k results below
+> **Implementation note (2026-06-14):** The production target is now a fully
+> streaming pipeline below 100 ms with no lookahead and teacher-content cosine
+> approaching 0.99. The selected student is 768d x 10 layers with two seconds
+> of bounded causal history. It predicts MioCodec's five FSQ axes directly and
+> applies the teacher's frozen 5d-to-768d projection. Training now uses three
+> phases: original VCTK transcript CTC, a gradual original/teacher blend, and
+> teacher-heavy FSQ distillation with 10% original retention.
+>
+> The teacher projection was recovered exactly from cached `ct` and `ce_768`
+> pairs: reconstruction max error was `2.384e-07`, and the recovered parameters
+> differed from the directly extracted teacher parameters by at most `3e-08`.
+>
+> Saturated-cache MPS measurements for the selected configuration were
+> 29.3 ms p50 / 30.5 ms p95 for content and 32.4 ms p50 / 33.0 ms p95 through the causal mel
+> decoder. This fits the 40 ms content-frame throughput budget without future
+> context. A production causal waveform decoder is still required before the
+> end-to-end waveform pipeline can be called complete.
+>
+> The historical v3/v3-4k results below
 > were produced with symmetrically padded Conv1d layers and utterance-level
 > validation splits. The current `astrape/` implementation replaces them with
 > left-padded causal convolutions, stateful streaming inference,
@@ -21,7 +39,7 @@
 
 ## 1. Overview
 
-**Goal**: Build a real-time (<200ms) zero-shot voice conversion pipeline by distilling MioCodec's offline quality into a fully causal, streaming-capable system.
+**Goal**: Build a real-time (<100ms) zero-shot voice conversion pipeline by distilling MioCodec's offline quality into a fully causal, streaming-capable system.
 
 **Core idea**: MioCodec teacher (25Hz, 44.1kHz) provides upper-bound quality. Student learns to replicate content encoding and speaker conditioning in a causal manner.
 

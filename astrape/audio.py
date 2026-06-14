@@ -30,13 +30,32 @@ class StreamingLogMel:
         self.n_mels = n_mels
         self.f_min = f_min
         self.f_max = f_max
+        self._kernel_cache: dict[
+            tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+
+    def _kernels(self, waveform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (waveform.device, waveform.dtype)
+        cached = self._kernel_cache.get(key)
+        if cached is None:
+            window = torch.hann_window(
+                self.n_fft, device=waveform.device, dtype=waveform.dtype
+            )
+            filter_bank = torchaudio.functional.melscale_fbanks(
+                n_freqs=self.n_fft // 2 + 1,
+                f_min=self.f_min,
+                f_max=self.f_max,
+                n_mels=self.n_mels,
+                sample_rate=self.sample_rate,
+            ).to(device=waveform.device, dtype=waveform.dtype)
+            cached = (window, filter_bank)
+            self._kernel_cache[key] = cached
+        return cached
 
     def _extract(self, waveform: torch.Tensor) -> torch.Tensor:
         if waveform.shape[-1] < self.n_fft:
             return waveform.new_empty(waveform.shape[0], self.n_mels, 0)
-        window = torch.hann_window(
-            self.n_fft, device=waveform.device, dtype=waveform.dtype
-        )
+        window, filter_bank = self._kernels(waveform)
         spectrum = torch.stft(
             waveform,
             n_fft=self.n_fft,
@@ -46,13 +65,6 @@ class StreamingLogMel:
             return_complex=True,
         )
         power = spectrum.abs().square().transpose(1, 2)
-        filter_bank = torchaudio.functional.melscale_fbanks(
-            n_freqs=self.n_fft // 2 + 1,
-            f_min=self.f_min,
-            f_max=self.f_max,
-            n_mels=self.n_mels,
-            sample_rate=self.sample_rate,
-        ).to(device=waveform.device, dtype=waveform.dtype)
         mel = torch.matmul(power, filter_bank).transpose(1, 2)
         return torch.log(mel.clamp_min(1e-5))
 

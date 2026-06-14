@@ -5,6 +5,7 @@ import argparse
 import math
 import statistics
 import time
+from dataclasses import replace
 
 import torch
 
@@ -39,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seconds", type=float, default=3.0)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=30)
+    parser.add_argument("--attention-context-frames", type=int, default=100)
     parser.add_argument("--tiers", nargs="+", choices=sorted(TIERS), default=list(TIERS))
     return parser.parse_args()
 
@@ -51,11 +53,15 @@ def main() -> None:
     x = torch.randn(1, 80, mel_frames, device=device)
     print(
         f"{'Tier':>8} {'Params':>9} {'Full p50':>10} {'Full p95':>10} "
-        f"{'Stream/frame':>13} {'RTF':>8}"
+        f"{'Stream p50':>11} {'Stream p95':>11} {'RTF':>8}"
     )
     for name in args.tiers:
         tier = TIERS[name]
-        model = ContentStudent(tier.model).to(device).eval()
+        model_config = replace(
+            tier.model,
+            max_attention_context=args.attention_context_frames,
+        )
+        model = ContentStudent(model_config).to(device).eval()
         with torch.inference_mode():
             full = measure(
                 lambda: model(x),
@@ -64,26 +70,27 @@ def main() -> None:
                 args.repeats,
             )
 
-            def stream_once() -> None:
-                state = None
-                for start in range(0, mel_frames, 2):
-                    _, state = model.forward_stream(x[:, :, start : start + 2], state)
+            frame = x[:, :, :2]
+            state = None
+            for _ in range(args.attention_context_frames // 2 + 2):
+                _, state = model.forward_stream(frame, state)
 
-            streamed = measure(
-                stream_once,
-                device,
-                max(2, args.warmup // 5),
-                max(5, args.repeats // 3),
-            )
+            def stream_frame() -> None:
+                nonlocal state
+                _, state = model.forward_stream(frame, state)
+
+            streamed = measure(stream_frame, device, args.warmup, args.repeats)
         params = sum(parameter.numel() for parameter in model.parameters()) / 1e6
         full_p50 = statistics.median(full)
         full_p95 = sorted(full)[min(len(full) - 1, math.ceil(len(full) * 0.95) - 1)]
-        content_frames = mel_frames // 2
-        stream_per_frame = statistics.median(streamed) / content_frames
+        stream_p50 = statistics.median(streamed)
+        stream_p95 = sorted(streamed)[
+            min(len(streamed) - 1, math.ceil(len(streamed) * 0.95) - 1)
+        ]
         rtf = full_p50 / (args.seconds * 1000)
         print(
             f"{name:>8} {params:8.1f}M {full_p50:9.1f}ms {full_p95:9.1f}ms "
-            f"{stream_per_frame:12.2f}ms {rtf:8.3f}"
+            f"{stream_p50:10.2f}ms {stream_p95:10.2f}ms {rtf:8.3f}"
         )
 
 

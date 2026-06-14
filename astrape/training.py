@@ -53,6 +53,9 @@ def _move(batch: ContentBatch, device: torch.device) -> ContentBatch:
         mel=batch.mel.to(device),
         content=batch.content.to(device),
         pre_fsq=batch.pre_fsq.to(device) if batch.pre_fsq is not None else None,
+        token_indices=(
+            batch.token_indices.to(device) if batch.token_indices is not None else None
+        ),
         input_lengths=batch.input_lengths.to(device),
         target_lengths=batch.target_lengths.to(device),
         target_mask=batch.target_mask.to(device),
