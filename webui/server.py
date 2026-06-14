@@ -104,6 +104,7 @@ def _mio_python() -> str:
     candidates = [
         configured,
         sys.executable if importlib.util.find_spec("miocodec") else None,
+        str(ROOT / ".venv-mio" / "bin" / "python"),
         "/Users/asill/btrvrc0/.venv/bin/python",
     ]
     for candidate in candidates:

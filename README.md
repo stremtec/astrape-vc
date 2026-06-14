@@ -20,8 +20,8 @@ path that activates when a production direct-wave checkpoint is available.
 16 kHz source PCM
   -> streaming log-mel, 50 Hz
   -> strictly causal 768x10 ContentStudent, 2 s bounded history
-  -> 5-axis FSQ prediction
-  -> frozen MioCodec 5d-to-768d projection, 25 Hz
+  -> continuous 768d content, 25 Hz
+     + auxiliary 5-axis FSQ prediction and frozen Mio projection
   -> DirectWaveDecoder + cached VoiceBank global embedding, 128d
   -> 44.1 kHz PCM
 ```
@@ -36,7 +36,8 @@ through the MioCodec teacher decoder.
 
 - `astrape.model.ContentStudent`: left-padded causal convolutions, causal
   attention, aligned 50 Hz to 25 Hz downsampling, bounded streaming state,
-  and an FSQ-aware output head matching MioCodec's `[8,8,8,5,5]` code axes.
+  a continuous 768d deployment head, and a parallel FSQ head matching
+  MioCodec's `[8,8,8,5,5]` code axes.
 - `astrape.mel_decoder.CausalMelDecoder`: source-restored AdaLN-Zero decoder
   matching `checkpoints/causal_mel_decoder.pt`; retained as an auxiliary
   acoustic target and diagnostic.
@@ -65,11 +66,31 @@ new causal architecture before reporting causal quality.
 # Recover the teacher's exact frozen 5d-to-768d projection from cached labels
 .venv/bin/python extract_fsq_projection.py
 
-# Original VCTK CTC -> gradual blend -> MioCodec FSQ distillation
+# Preferred direct continuous + auxiliary CTC training
+.venv/bin/python train_content_flat_ctc.py \
+  --hidden 512 --layers 10 --heads 8 \
+  --steps-per-epoch 1000 --probe-samples 1024 \
+  --full-validation-every 5 \
+  --device mps
+
+# Mio-shaped strict-causal backbone: 768x6, 12 heads, RoPE, SwiGLU
+.venv/bin/python train_content_flat_ctc.py \
+  --architecture mio_causal \
+  --steps-per-epoch 1000 --probe-samples 1024 \
+  --full-validation-every 5 \
+  --device mps
+
+# Quality-first Mio causal training. Phase 1 is teacher-only; phase 2 samples
+# teacher-cache and original-VCTK batches at an exact 50:50 ratio.
+./run_mio_two_phase.sh
+
+# Full 41-hour compact teacher cache, then hybrid training
+./run_full_content_pipeline.sh
+
+# Historical original-CTC curriculum, retained for comparison
 .venv/bin/python train_content_curriculum.py \
   --audio-root /path/to/VCTK/wav48_silence_trimmed \
-  --transcript-root /path/to/VCTK/txt \
-  --device mps
+  --transcript-root /path/to/VCTK/txt
 
 # Causal mel decoder
 .venv/bin/python train_mel_decoder.py --target-mode teacher
@@ -84,9 +105,31 @@ new causal architecture before reporting causal quality.
   --device mps
 ```
 
-Training uses speaker-disjoint validation, aligned even-frame crops, masked
-variable-length losses, deterministic seeds, full validation, versioned
-checkpoints, and separate `.best.pt`/`.last.pt` files.
+Training uses speaker-disjoint validation, aligned even-frame crops, causal
+history warmup, masked variable-length losses, deterministic seeds, full
+validation, versioned checkpoints, and separate `.best.pt`/`.last.pt` files.
+
+The quality-first Mio causal trainer uses a direct continuous 768d content head
+and a small character-CTC auxiliary head. Phase 1 trains only against cached Mio
+teacher targets, including aligned transcript CTC. Phase 2 starts from the best
+phase-1 probe checkpoint at a lower learning rate and samples teacher-cache and
+original full-utterance VCTK batches at an exact 50:50 ratio. Original batches
+apply only weighted CTC, while Mio teacher cosine remains the checkpoint
+selection criterion. There is no random crop that would invalidate transcript
+alignment.
+
+Each short epoch runs 1,000 optimizer updates and evaluates a fixed,
+speaker-balanced probe. Full speaker-disjoint validation runs every five
+epochs and at both phase boundaries. Phase-1 best, global probe-best, and
+full-validation best checkpoints are stored separately. The structured
+five-axis FSQ trainer remains available as a later comparison.
+
+`extract_content_cache.py` caches all VCTK mic1 utterances and transcripts
+without storing
+waveforms or global speaker embeddings. Log-mel, Mio content, and pre-FSQ
+targets use FP16 storage, FSQ tokens use uint16, and character transcripts use
+uint8. Teacher inference remains FP32 on MPS; only serialized arrays are
+reduced in precision.
 
 The curriculum keeps validation speakers out of both original and teacher
 training. Its phases are:
@@ -95,10 +138,10 @@ training. Its phases are:
 2. A gradual mixture of original CTC and MioCodec teacher supervision.
 3. 90% teacher FSQ distillation with 10% original-data retention.
 
-Teacher training predicts the five discrete FSQ axes directly. Exact axes
-reconstruct cached `ce_768` through the frozen teacher projection, so the
-deployment metric is hard-code teacher cosine rather than similarity to the
-source audio. The configured target is `0.99`.
+The configured target remains full-context Mio teacher cosine `0.99`, measured
+on the direct 768d output. Soft and hard FSQ cosine, per-axis accuracy, exact
+token accuracy, sequence cosine, and frame-cosine p05 are reported separately
+so FSQ fidelity cannot hide regressions in the deployment representation.
 
 ## VoiceBank Policy
 

@@ -15,6 +15,7 @@ from astrape.curriculum import (
     validate_curriculum,
 )
 from astrape.data import (
+    MioContentDataset,
     ContentSample,
     crop_aligned,
     masked_content_loss,
@@ -27,9 +28,25 @@ from astrape.fsq import (
     indices_to_codes,
     indices_to_level_indices,
 )
+from astrape.hybrid_training import (
+    HybridTrainingConfig,
+    hybrid_teacher_loss,
+)
+from astrape.flat_ctc_training import (
+    FlatCtcTrainingConfig,
+    flat_ctc_loss,
+    speaker_balanced_subset,
+    validate_flat_ctc_config,
+)
 from astrape.original_data import OriginalBatch, minimum_ctc_frames
 from astrape.streaming_pipeline import OutputRingBuffer, StreamingVoiceConverter
 from astrape.text import VOCAB_SIZE
+from astrape.two_phase_training import (
+    TwoPhaseTrainingConfig,
+    phase2_source_schedule,
+    phase_for_epoch,
+    validate_two_phase_config,
+)
 from astrape.voicebank import (
     MIN_REFERENCE_SECONDS,
     MIO_GLOBAL_MODEL,
@@ -57,6 +74,19 @@ class CoreTests(unittest.TestCase):
                 n_layers=2,
                 n_heads=4,
                 content_dim=32,
+            )
+        ).eval()
+
+    def small_mio_causal_student(self) -> ContentStudent:
+        return ContentStudent(
+            ContentStudentConfig(
+                architecture="mio_causal",
+                hidden=64,
+                n_layers=2,
+                n_heads=4,
+                content_dim=32,
+                max_attention_context=8,
+                mio_ff_hidden=128,
             )
         ).eval()
 
@@ -128,6 +158,65 @@ class CoreTests(unittest.TestCase):
         torch.testing.assert_close(
             torch.cat(chunks, dim=-1), expected, atol=2e-6, rtol=2e-6
         )
+
+    def test_mio_causal_student_has_no_future_leakage(self):
+        model = self.small_mio_causal_student()
+        prefix = torch.randn(1, 80, 13)
+        suffix = torch.randn(1, 80, 8)
+        prefix_output = model(prefix).content
+        full_output = model(torch.cat((prefix, suffix), dim=-1)).content
+        torch.testing.assert_close(
+            prefix_output,
+            full_output[:, :, : prefix_output.shape[-1]],
+            atol=2e-6,
+            rtol=2e-6,
+        )
+
+    def test_mio_causal_student_streaming_matches_irregular_chunks(self):
+        model = self.small_mio_causal_student()
+        x = torch.randn(1, 80, 23)
+        expected = model(x).content
+        state = None
+        chunks = []
+        start = 0
+        for length in (1, 4, 2, 7, 3, 6):
+            output, state = model.forward_stream(
+                x[:, :, start : start + length],
+                state,
+                flush=start + length == x.shape[-1],
+            )
+            chunks.append(output.content)
+            start += length
+        torch.testing.assert_close(
+            torch.cat(chunks, dim=-1),
+            expected,
+            atol=2e-6,
+            rtol=2e-6,
+        )
+
+    def test_two_phase_schedule_is_exact_and_reproducible(self):
+        first = phase2_source_schedule(1000, 0.5, 44)
+        second = phase2_source_schedule(1000, 0.5, 44)
+        self.assertEqual(first, second)
+        self.assertEqual(sum(first), 500)
+        self.assertEqual(len(first) - sum(first), 500)
+
+    def test_two_phase_boundaries(self):
+        config = TwoPhaseTrainingConfig(
+            data_dir=Path("cache"),
+            audio_root=Path("audio"),
+            transcript_root=Path("text"),
+            output_dir=Path("checkpoints"),
+            phase1_epochs=2,
+            phase2_epochs=3,
+        )
+        validate_two_phase_config(config)
+        self.assertEqual(phase_for_epoch(0, config), "teacher")
+        self.assertEqual(phase_for_epoch(1, config), "teacher")
+        self.assertEqual(phase_for_epoch(2, config), "teacher_original")
+        self.assertEqual(phase_for_epoch(4, config), "teacher_original")
+        with self.assertRaises(ValueError):
+            phase_for_epoch(5, config)
 
     def test_mel_decoder_streaming_matches_full_sequence(self):
         decoder = CausalMelDecoder(
@@ -426,6 +515,42 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(cropped.mel.shape[1], 8)
         self.assertEqual(cropped.content.shape[0], 4)
 
+    def test_crop_with_history_masks_warmup_frames(self):
+        mel = torch.arange(32).repeat(80, 1).float()
+        content = torch.arange(16).unsqueeze(1).repeat(1, 4).float()
+        sample = ContentSample(mel, content, content.clone(), None, "p001", 0)
+
+        class MiddleChoice(random.Random):
+            def choice(self, sequence):
+                return sequence[len(sequence) // 2]
+
+        cropped = crop_aligned(sample, 8, MiddleChoice(), history_mel_frames=8)
+        self.assertGreater(cropped.supervision_start, 0)
+        self.assertEqual(cropped.mel.shape[1], 16)
+        self.assertEqual(cropped.content.shape[0], 8)
+
+    def test_compact_content_cache_loads_mel_from_target_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            np.savez(
+                root / "meta.npz",
+                spk_names=np.asarray(["p001"]),
+                n_samples=np.asarray(1),
+            )
+            np.savez(
+                root / "s_00000.npz",
+                logmel=np.zeros((80, 12), dtype=np.float16),
+                ce_768=np.zeros((6, 16), dtype=np.float16),
+                pre_fsq_768=np.zeros((6, 16), dtype=np.float16),
+                ct=np.zeros(6, dtype=np.uint16),
+                transcript=np.asarray([1, 2, 3], dtype=np.uint8),
+            )
+            sample = MioContentDataset(root, root)[0]
+            self.assertEqual(tuple(sample.mel.shape), (80, 12))
+            self.assertEqual(tuple(sample.content.shape), (6, 16))
+            self.assertEqual(sample.token_indices.dtype, torch.long)
+            self.assertTrue(torch.equal(sample.transcript, torch.tensor([1, 2, 3])))
+
     def test_masked_loss_ignores_padding(self):
         prediction = torch.zeros(2, 3, 4)
         target = torch.zeros(2, 4, 3)
@@ -453,6 +578,19 @@ class CoreTests(unittest.TestCase):
             )
             self.assertEqual(metadata["format_version"], 1)
             self.assertEqual(loaded_legacy.config.hidden, model.config.hidden)
+
+    def test_mio_causal_checkpoint_roundtrip(self):
+        model = self.small_mio_causal_student()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mio-causal.pt"
+            save_checkpoint(path, model, epoch=2, metrics={"val_cosine": 0.4})
+            loaded, metadata = load_content_checkpoint(path)
+            self.assertEqual(metadata["epoch"], 2)
+            self.assertEqual(loaded.config, model.config)
+            self.assertEqual(
+                loaded(torch.randn(1, 80, 9)).content.shape,
+                model(torch.randn(1, 80, 9)).content.shape,
+            )
 
     def test_mel_decoder_checkpoint_roundtrip(self):
         model = CausalMelDecoder(
@@ -504,6 +642,120 @@ class CoreTests(unittest.TestCase):
             codes, projection["weight"], projection["bias"]
         ).transpose(1, 2)
         torch.testing.assert_close(output.content, expected)
+
+    def test_hybrid_content_keeps_continuous_and_fsq_outputs(self):
+        config = ContentStudentConfig(
+            hidden=64,
+            n_layers=2,
+            n_heads=4,
+            content_dim=16,
+            auxiliary_prefsq=True,
+            structured_fsq=True,
+            hybrid_content=True,
+        )
+        model = ContentStudent(config)
+        model.load_fsq_projection(
+            {"weight": torch.randn(16, 5), "bias": torch.randn(16)}
+        )
+        output = model(torch.randn(2, 80, 20))
+        self.assertEqual(tuple(output.content.shape), (2, 16, 10))
+        self.assertEqual(tuple(output.soft_fsq_content.shape), (2, 16, 10))
+        self.assertEqual(tuple(output.hard_content.shape), (2, 16, 10))
+        self.assertEqual(tuple(output.soft_fsq_codes.shape), (2, 10, 5))
+
+    def test_hybrid_teacher_loss_updates_both_heads(self):
+        config = ContentStudentConfig(
+            hidden=32,
+            n_layers=1,
+            n_heads=4,
+            content_dim=16,
+            auxiliary_prefsq=True,
+            structured_fsq=True,
+            hybrid_content=True,
+        )
+        model = ContentStudent(config)
+        model.load_fsq_projection(
+            {"weight": torch.randn(16, 5), "bias": torch.randn(16)}
+        )
+        from astrape.data import ContentBatch
+
+        batch = ContentBatch(
+            mel=torch.randn(2, 80, 12),
+            content=torch.randn(2, 6, 16),
+            pre_fsq=torch.randn(2, 6, 16),
+            token_indices=torch.randint(0, 12800, (2, 6)),
+            input_lengths=torch.tensor([12, 12]),
+            target_lengths=torch.tensor([6, 6]),
+            target_mask=torch.ones(2, 6, dtype=torch.bool),
+        )
+        training = HybridTrainingConfig(
+            data_dir=Path("."),
+            mel_dir=Path("."),
+            fsq_projection=Path("."),
+            output_dir=Path("."),
+        )
+        loss, metrics = hybrid_teacher_loss(model, batch, training)
+        loss.backward()
+        self.assertGreater(model.content_head.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(model.fsq_head.weight.grad.abs().sum().item(), 0.0)
+        self.assertIn("direct_cosine", metrics)
+
+    def test_flat_ctc_loss_updates_content_and_text_heads(self):
+        model = ContentStudent(
+            ContentStudentConfig(
+                hidden=32,
+                n_layers=1,
+                n_heads=4,
+                content_dim=16,
+                text_vocab_size=VOCAB_SIZE,
+            )
+        )
+        from astrape.data import ContentBatch
+
+        batch = ContentBatch(
+            mel=torch.randn(2, 80, 12),
+            content=torch.randn(2, 6, 16),
+            pre_fsq=None,
+            token_indices=None,
+            input_lengths=torch.tensor([12, 12]),
+            target_lengths=torch.tensor([6, 6]),
+            target_mask=torch.ones(2, 6, dtype=torch.bool),
+            transcripts=torch.tensor([1, 2, 3, 2, 3, 4]),
+            transcript_lengths=torch.tensor([3, 3]),
+        )
+        config = FlatCtcTrainingConfig(
+            data_dir=Path("."),
+            output_dir=Path("."),
+        )
+        loss, metrics = flat_ctc_loss(
+            model,
+            batch,
+            config,
+            torch.nn.CTCLoss(blank=0, zero_infinity=True),
+        )
+        loss.backward()
+        self.assertGreater(model.content_head.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(model.text_head.weight.grad.abs().sum().item(), 0.0)
+        self.assertIn("ctc_loss", metrics)
+
+    def test_flat_ctc_probe_is_deterministic_and_speaker_balanced(self):
+        speakers = np.array(["a"] * 5 + ["b"] * 5 + ["c"] * 5)
+        indices = np.arange(len(speakers))
+        first = speaker_balanced_subset(indices, speakers, 6, 42)
+        second = speaker_balanced_subset(indices, speakers, 6, 42)
+        self.assertTrue(np.array_equal(first, second))
+        self.assertEqual(set(speakers[first]), {"a", "b", "c"})
+        self.assertEqual(len(first), 6)
+
+    def test_flat_ctc_rejects_conflicting_checkpoint_modes(self):
+        config = FlatCtcTrainingConfig(
+            data_dir=Path("."),
+            output_dir=Path("."),
+            resume=Path("resume.pt"),
+            init_checkpoint=Path("init.pt"),
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            validate_flat_ctc_config(config)
 
     def test_fsq_index_roundtrip_targets(self):
         indices = torch.tensor([[0, 930, 12799]])

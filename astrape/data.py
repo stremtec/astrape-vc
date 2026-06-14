@@ -19,6 +19,8 @@ class ContentSample:
     token_indices: Optional[torch.Tensor]
     speaker: str
     index: int
+    supervision_start: int = 0
+    transcript: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -30,6 +32,8 @@ class ContentBatch:
     input_lengths: torch.Tensor
     target_lengths: torch.Tensor
     target_mask: torch.Tensor
+    transcripts: Optional[torch.Tensor] = None
+    transcript_lengths: Optional[torch.Tensor] = None
 
 
 class MioContentDataset(Dataset[ContentSample]):
@@ -55,9 +59,14 @@ class MioContentDataset(Dataset[ContentSample]):
 
     def __getitem__(self, item: int) -> ContentSample:
         index = int(self.indices[item])
-        with np.load(self.mel_dir / f"m_{index:05d}.npz") as mel_data:
-            mel = torch.from_numpy(mel_data["logmel"]).float()
-        with np.load(self.data_dir / f"s_{index:05d}.npz") as output_data:
+        output_path = self.data_dir / f"s_{index:05d}.npz"
+        mel_path = self.mel_dir / f"m_{index:05d}.npz"
+        with np.load(output_path) as output_data:
+            if "logmel" in output_data:
+                mel = torch.from_numpy(output_data["logmel"]).float()
+            else:
+                with np.load(mel_path) as mel_data:
+                    mel = torch.from_numpy(mel_data["logmel"]).float()
             content = torch.from_numpy(output_data["ce_768"]).float()
             pre_fsq = (
                 torch.from_numpy(output_data["pre_fsq_768"]).float()
@@ -69,6 +78,11 @@ class MioContentDataset(Dataset[ContentSample]):
                 if "ct" in output_data
                 else None
             )
+            transcript = (
+                torch.from_numpy(output_data["transcript"]).long()
+                if "transcript" in output_data
+                else None
+            )
         return ContentSample(
             mel=mel,
             content=content,
@@ -76,6 +90,7 @@ class MioContentDataset(Dataset[ContentSample]):
             token_indices=token_indices,
             speaker=self.speakers[index],
             index=index,
+            transcript=transcript,
         )
 
 
@@ -104,43 +119,68 @@ def speaker_disjoint_split(
 
 
 def crop_aligned(
-    sample: ContentSample, max_mel_frames: Optional[int], rng: random.Random
+    sample: ContentSample,
+    max_mel_frames: Optional[int],
+    rng: random.Random,
+    history_mel_frames: int = 0,
 ) -> ContentSample:
     if max_mel_frames is None or sample.mel.shape[1] <= max_mel_frames:
         return sample
     if max_mel_frames <= 0 or max_mel_frames % 2:
         raise ValueError("max_mel_frames must be a positive even number")
+    if history_mel_frames < 0 or history_mel_frames % 2:
+        raise ValueError("history_mel_frames must be a non-negative even number")
     max_start = sample.mel.shape[1] - max_mel_frames
     starts = range(0, max_start + 1, 2)
-    start = rng.choice(starts)
-    target_start = start // 2
-    target_length = (max_mel_frames + 1) // 2
+    supervision_mel_start = rng.choice(starts)
+    input_start = max(0, supervision_mel_start - history_mel_frames)
+    input_end = supervision_mel_start + max_mel_frames
+    target_start = input_start // 2
+    target_end = (input_end + 1) // 2
     return ContentSample(
-        mel=sample.mel[:, start : start + max_mel_frames],
-        content=sample.content[target_start : target_start + target_length],
+        mel=sample.mel[:, input_start:input_end],
+        content=sample.content[target_start:target_end],
         pre_fsq=(
-            sample.pre_fsq[target_start : target_start + target_length]
+            sample.pre_fsq[target_start:target_end]
             if sample.pre_fsq is not None
             else None
         ),
         token_indices=(
-            sample.token_indices[target_start : target_start + target_length]
+            sample.token_indices[target_start:target_end]
             if sample.token_indices is not None
             else None
         ),
         speaker=sample.speaker,
         index=sample.index,
+        supervision_start=(supervision_mel_start - input_start) // 2,
+        transcript=sample.transcript,
     )
 
 
 class ContentCollator:
-    def __init__(self, max_mel_frames: Optional[int], seed: int):
+    def __init__(
+        self,
+        max_mel_frames: Optional[int],
+        seed: int,
+        history_mel_frames: int = 0,
+        include_transcripts: bool = False,
+    ):
+        if include_transcripts and max_mel_frames is not None:
+            raise ValueError("CTC transcripts require full utterances")
         self.max_mel_frames = max_mel_frames
+        self.history_mel_frames = history_mel_frames
+        self.include_transcripts = include_transcripts
         self.rng = random.Random(seed)
 
     def __call__(self, samples: list[ContentSample]) -> ContentBatch:
         samples = [
-            crop_aligned(sample, self.max_mel_frames, self.rng) for sample in samples
+            crop_aligned(
+                sample,
+                self.max_mel_frames,
+                self.rng,
+                self.history_mel_frames,
+            )
+            for sample in samples
         ]
         input_lengths = torch.tensor(
             [sample.mel.shape[1] for sample in samples], dtype=torch.long
@@ -200,7 +240,22 @@ class ContentCollator:
                 ]
             )
         positions = torch.arange(max_target)
-        target_mask = positions.unsqueeze(0) < target_lengths.unsqueeze(1)
+        supervision_starts = torch.tensor(
+            [sample.supervision_start for sample in samples], dtype=torch.long
+        )
+        target_mask = (
+            positions.unsqueeze(0) < target_lengths.unsqueeze(1)
+        ) & (positions.unsqueeze(0) >= supervision_starts.unsqueeze(1))
+        transcripts = None
+        transcript_lengths = None
+        if self.include_transcripts:
+            if not all(sample.transcript is not None for sample in samples):
+                raise ValueError("CTC batch contains a sample without a transcript")
+            transcript_lengths = torch.tensor(
+                [sample.transcript.numel() for sample in samples],
+                dtype=torch.long,
+            )
+            transcripts = torch.cat([sample.transcript for sample in samples])
         return ContentBatch(
             mel=mel,
             content=content,
@@ -209,6 +264,8 @@ class ContentCollator:
             input_lengths=input_lengths,
             target_lengths=target_lengths,
             target_mask=target_mask,
+            transcripts=transcripts,
+            transcript_lengths=transcript_lengths,
         )
 
 

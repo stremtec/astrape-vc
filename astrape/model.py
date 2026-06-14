@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class ContentStudentConfig:
+    architecture: str = "legacy"
     in_dim: int = 80
     hidden: int = 384
     n_layers: int = 6
@@ -21,19 +22,25 @@ class ContentStudentConfig:
     dropout: float = 0.0
     auxiliary_prefsq: bool = False
     structured_fsq: bool = False
+    hybrid_content: bool = False
     fsq_levels: tuple[int, ...] = (8, 8, 8, 5, 5)
     text_vocab_size: int = 0
     safe_convs: bool = False
     max_attention_context: Optional[int] = None
+    rope_theta: float = 10000.0
+    norm_eps: float = 1e-5
+    mio_ff_hidden: Optional[int] = None
 
 
 @dataclass
 class ContentStudentOutput:
     content: torch.Tensor
     pre_fsq: Optional[torch.Tensor] = None
+    soft_fsq_content: Optional[torch.Tensor] = None
     hard_content: Optional[torch.Tensor] = None
     fsq_logits: Optional[tuple[torch.Tensor, ...]] = None
     fsq_codes: Optional[torch.Tensor] = None
+    soft_fsq_codes: Optional[torch.Tensor] = None
     text_logits: Optional[torch.Tensor] = None
 
 
@@ -268,37 +275,270 @@ class CausalTransformerBlock(nn.Module):
         return x, next_history
 
 
+def _apply_rotary(
+    tensor: torch.Tensor,
+    positions: torch.Tensor,
+    theta: float,
+) -> torch.Tensor:
+    head_dim = tensor.shape[-1]
+    if head_dim % 2:
+        raise ValueError("RoPE requires an even attention head dimension")
+    frequencies = 1.0 / (
+        theta
+        ** (
+            torch.arange(
+                0,
+                head_dim,
+                2,
+                device=tensor.device,
+                dtype=torch.float32,
+            )
+            / head_dim
+        )
+    )
+    angles = positions.to(torch.float32).unsqueeze(1) * frequencies.unsqueeze(0)
+    cos = torch.cos(angles).to(tensor.dtype).view(1, -1, 1, head_dim // 2)
+    sin = torch.sin(angles).to(tensor.dtype).view(1, -1, 1, head_dim // 2)
+    pairs = tensor.reshape(*tensor.shape[:-1], head_dim // 2, 2)
+    real = pairs[..., 0]
+    imaginary = pairs[..., 1]
+    rotated = torch.stack(
+        (
+            real * cos - imaginary * sin,
+            real * sin + imaginary * cos,
+        ),
+        dim=-1,
+    )
+    return rotated.flatten(-2)
+
+
+class MioCausalAttention(nn.Module):
+    """Mio-style bias-free local attention with causal RoPE."""
+
+    def __init__(self, config: ContentStudentConfig):
+        super().__init__()
+        self.n_heads = config.n_heads
+        self.head_dim = config.hidden // config.n_heads
+        self.dropout = config.dropout
+        self.max_context = config.max_attention_context
+        self.rope_theta = config.rope_theta
+        self.wq = nn.Linear(config.hidden, config.hidden, bias=False)
+        self.wk = nn.Linear(config.hidden, config.hidden, bias=False)
+        self.wv = nn.Linear(config.hidden, config.hidden, bias=False)
+        self.wo = nn.Linear(config.hidden, config.hidden, bias=False)
+
+    def _project(
+        self,
+        layer: nn.Linear,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, length, _ = tensor.shape
+        return layer(tensor).view(
+            batch,
+            length,
+            self.n_heads,
+            self.head_dim,
+        )
+
+    def _attend(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        query_positions: torch.Tensor,
+        key_positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        query = _apply_rotary(query, query_positions, self.rope_theta)
+        keys = _apply_rotary(keys, key_positions, self.rope_theta)
+        allowed = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+        if self.max_context is not None:
+            allowed = allowed & (
+                key_positions.unsqueeze(0)
+                >= query_positions.unsqueeze(1) - self.max_context + 1
+            )
+        allowed = allowed.view(1, 1, query.shape[1], keys.shape[1])
+        if key_padding_mask is not None:
+            allowed = allowed & ~key_padding_mask[:, None, None, :]
+        attended = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            keys.transpose(1, 2),
+            values.transpose(1, 2),
+            attn_mask=allowed,
+            dropout_p=self.dropout if self.training else 0.0,
+            scale=self.head_dim**-0.5,
+        ).transpose(1, 2)
+        return self.wo(attended.flatten(2))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        positions = torch.arange(x.shape[1], device=x.device)
+        return self._attend(
+            self._project(self.wq, x),
+            self._project(self.wk, x),
+            self._project(self.wv, x),
+            positions,
+            positions,
+            key_padding_mask,
+        )
+
+    def forward_stream(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        position: int,
+    ) -> torch.Tensor:
+        history_length = keys.shape[1] - query.shape[1]
+        query_positions = position + torch.arange(
+            query.shape[1],
+            device=query.device,
+        )
+        key_positions = position - history_length + torch.arange(
+            keys.shape[1],
+            device=query.device,
+        )
+        return self._attend(
+            self._project(self.wq, query),
+            self._project(self.wk, keys),
+            self._project(self.wv, keys),
+            query_positions,
+            key_positions,
+        )
+
+
+class MioSwiGLU(nn.Module):
+    def __init__(self, config: ContentStudentConfig):
+        super().__init__()
+        hidden = config.mio_ff_hidden
+        if hidden is None:
+            raw_hidden = math.ceil(8 * config.hidden / 3)
+            hidden = 256 * math.ceil(raw_hidden / 256)
+        self.w1 = nn.Linear(config.hidden, hidden, bias=False)
+        self.w2 = nn.Linear(hidden, config.hidden, bias=False)
+        self.w3 = nn.Linear(config.hidden, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class MioCausalTransformerBlock(nn.Module):
+    """Causal counterpart of MioCodec's local TransformerBlock."""
+
+    def __init__(self, config: ContentStudentConfig):
+        super().__init__()
+        self.attention_norm = nn.LayerNorm(
+            config.hidden,
+            eps=config.norm_eps,
+        )
+        self.attention = MioCausalAttention(config)
+        self.ffn_norm = nn.LayerNorm(
+            config.hidden,
+            eps=config.norm_eps,
+        )
+        self.feed_forward = MioSwiGLU(config)
+        self.dropout = config.dropout
+        self.max_context = config.max_attention_context
+        self.apply(self._initialize_linear)
+
+    @staticmethod
+    def _initialize_linear(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_normal_(module.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        attended = self.attention(
+            self.attention_norm(x),
+            key_padding_mask,
+        )
+        x = x + F.dropout(attended, self.dropout, self.training)
+        fed = self.feed_forward(self.ffn_norm(x))
+        return x + F.dropout(fed, self.dropout, self.training)
+
+    def forward_stream(
+        self,
+        x: torch.Tensor,
+        history: Optional[torch.Tensor],
+        max_context: Optional[int],
+        *,
+        position: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if history is None:
+            history = x[:, :0]
+        keys = torch.cat((history, x), dim=1)
+        attended = self.attention.forward_stream(
+            self.attention_norm(x),
+            self.attention_norm(keys),
+            position,
+        )
+        output = x + attended
+        output = output + self.feed_forward(self.ffn_norm(output))
+        next_history = keys
+        if max_context is not None:
+            next_history = next_history[:, -max_context:]
+        return output, next_history
+
+
 class ContentStudent(nn.Module):
     """Strictly causal mel-to-content student with stateful streaming inference."""
 
     def __init__(self, config: ContentStudentConfig):
         super().__init__()
+        if config.architecture not in {"legacy", "mio_causal"}:
+            raise ValueError("architecture must be 'legacy' or 'mio_causal'")
         if config.hidden % config.n_heads:
             raise ValueError("hidden must be divisible by n_heads")
+        if config.architecture == "mio_causal" and (
+            config.hidden // config.n_heads
+        ) % 2:
+            raise ValueError("mio_causal requires an even attention head dimension")
+        if config.rope_theta <= 0:
+            raise ValueError("rope_theta must be positive")
+        if config.mio_ff_hidden is not None and config.mio_ff_hidden <= 0:
+            raise ValueError("mio_ff_hidden must be positive when set")
         if config.max_attention_context is not None and config.max_attention_context <= 0:
             raise ValueError("max_attention_context must be positive")
         if config.structured_fsq and (
             not config.fsq_levels or any(level < 2 for level in config.fsq_levels)
         ):
             raise ValueError("structured FSQ levels must all be at least two")
+        if config.hybrid_content and not config.structured_fsq:
+            raise ValueError("hybrid_content requires structured_fsq")
         self.config = config
         conv_type = SafeCausalConv1d if config.safe_convs else CausalConv1d
-        self.stem = nn.Sequential(
-            conv_type(config.in_dim, config.hidden, config.kernel_size),
-            nn.GELU(),
-            conv_type(config.hidden, config.hidden, config.kernel_size),
-            nn.GELU(),
-        )
-        self.pos_enc = SinusoidalPositionEncoding(config.hidden)
-        self.blocks = nn.ModuleList(
-            [CausalTransformerBlock(config) for _ in range(config.n_layers)]
-        )
-        self.norm = nn.LayerNorm(config.hidden)
-        self.down = conv_type(config.hidden, config.hidden, 3, stride=2)
+        if config.architecture == "mio_causal":
+            self.stem = nn.Sequential(
+                conv_type(config.in_dim, config.hidden, 1),
+            )
+            self.pos_enc = None
+            self.blocks = nn.ModuleList(
+                [MioCausalTransformerBlock(config) for _ in range(config.n_layers)]
+            )
+            self.norm = nn.LayerNorm(config.hidden, eps=config.norm_eps)
+            self.down = conv_type(config.hidden, config.hidden, 2, stride=2)
+        else:
+            self.stem = nn.Sequential(
+                conv_type(config.in_dim, config.hidden, config.kernel_size),
+                nn.GELU(),
+                conv_type(config.hidden, config.hidden, config.kernel_size),
+                nn.GELU(),
+            )
+            self.pos_enc = SinusoidalPositionEncoding(config.hidden)
+            self.blocks = nn.ModuleList(
+                [CausalTransformerBlock(config) for _ in range(config.n_layers)]
+            )
+            self.norm = nn.LayerNorm(config.hidden)
+            self.down = conv_type(config.hidden, config.hidden, 3, stride=2)
         self.content_head = (
-            None
-            if config.structured_fsq
-            else conv_type(config.hidden, config.content_dim, 1)
+            conv_type(config.hidden, config.content_dim, 1)
+            if not config.structured_fsq or config.hybrid_content
+            else None
         )
         self.fsq_head = (
             conv_type(config.hidden, sum(config.fsq_levels), 1)
@@ -336,6 +576,7 @@ class ContentStudent(nn.Module):
         torch.Tensor,
         tuple[torch.Tensor, ...],
         torch.Tensor,
+        torch.Tensor,
     ]:
         if self.fsq_head is None or self.fsq_projection is None:
             raise RuntimeError("Structured FSQ head is not configured")
@@ -352,20 +593,16 @@ class ContentStudent(nn.Module):
             indices = axis_logits.argmax(dim=1)
             level_indices.append(indices)
             hard_codes.append(values[indices])
-            if self.training:
-                probabilities = torch.softmax(axis_logits, dim=1)
-                soft_codes.append(
-                    torch.sum(probabilities * values.view(1, -1, 1), dim=1)
-                )
+            probabilities = torch.softmax(axis_logits, dim=1)
+            soft_codes.append(
+                torch.sum(probabilities * values.view(1, -1, 1), dim=1)
+            )
         hard_code = torch.stack(hard_codes, dim=-1)
         hard_content = self.fsq_projection(hard_code).transpose(1, 2)
-        if self.training:
-            soft_code = torch.stack(soft_codes, dim=-1)
-            soft_content = self.fsq_projection(soft_code).transpose(1, 2)
-        else:
-            soft_content = hard_content
+        soft_code = torch.stack(soft_codes, dim=-1)
+        soft_content = self.fsq_projection(soft_code).transpose(1, 2)
         indices = torch.stack(level_indices, dim=-1)
-        return soft_content, hard_content, logits, indices
+        return soft_content, hard_content, logits, indices, soft_code
 
     @staticmethod
     def output_lengths(input_lengths: torch.Tensor) -> torch.Tensor:
@@ -375,7 +612,8 @@ class ContentStudent(nn.Module):
         self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None
     ) -> ContentStudentOutput:
         h = self.stem(x).transpose(1, 2)
-        h = self.pos_enc(h)
+        if self.pos_enc is not None:
+            h = self.pos_enc(h)
         padding_mask = None
         if lengths is not None:
             positions = torch.arange(h.shape[1], device=h.device)
@@ -386,26 +624,39 @@ class ContentStudent(nn.Module):
         text_logits = self.text_head(h) if self.text_head is not None else None
         h = self.down(h.transpose(1, 2))
         hard_content = None
+        soft_fsq_content = None
         fsq_logits = None
         fsq_codes = None
+        soft_fsq_codes = None
         if self.fsq_head is not None:
-            soft_content, hard_content, fsq_logits, fsq_codes = self._decode_fsq(h)
-            content = soft_content if self.training else hard_content
+            (
+                soft_fsq_content,
+                hard_content,
+                fsq_logits,
+                fsq_codes,
+                soft_fsq_codes,
+            ) = self._decode_fsq(h)
+            if self.config.hybrid_content:
+                content = self.content_head(h)
+            else:
+                content = soft_fsq_content if self.training else hard_content
         else:
             content = self.content_head(h)
         pre_fsq = self.prefsq_head(h) if self.prefsq_head is not None else None
         return ContentStudentOutput(
             content=content,
             pre_fsq=pre_fsq,
+            soft_fsq_content=soft_fsq_content,
             hard_content=hard_content,
             fsq_logits=fsq_logits,
             fsq_codes=fsq_codes,
+            soft_fsq_codes=soft_fsq_codes,
             text_logits=text_logits,
         )
 
     def initial_streaming_state(self) -> StreamingState:
         return StreamingState(
-            stem_caches=[None, None],
+            stem_caches=[None] * (2 if self.config.architecture == "legacy" else 1),
             block_histories=[None] * len(self.blocks),
         )
 
@@ -441,21 +692,35 @@ class ContentStudent(nn.Module):
                 state.pending_mel = None
             empty = x.new_empty(x.shape[0], self.config.content_dim, 0)
             return ContentStudentOutput(content=empty), state
-        h, state.stem_caches[0] = self.stem[0].forward_stream(
-            x, state.stem_caches[0]
-        )
-        h = self.stem[1](h)
-        h, state.stem_caches[1] = self.stem[2].forward_stream(
-            h, state.stem_caches[1]
-        )
-        h = self.stem[3](h).transpose(1, 2)
-        h = self.pos_enc(h, offset=state.position)
-        for index, block in enumerate(self.blocks):
-            h, state.block_histories[index] = block.forward_stream(
-                h,
-                state.block_histories[index],
-                self.config.max_attention_context,
+        if self.config.architecture == "mio_causal":
+            h, state.stem_caches[0] = self.stem[0].forward_stream(
+                x,
+                state.stem_caches[0],
             )
+            h = h.transpose(1, 2)
+            for index, block in enumerate(self.blocks):
+                h, state.block_histories[index] = block.forward_stream(
+                    h,
+                    state.block_histories[index],
+                    self.config.max_attention_context,
+                    position=state.position,
+                )
+        else:
+            h, state.stem_caches[0] = self.stem[0].forward_stream(
+                x, state.stem_caches[0]
+            )
+            h = self.stem[1](h)
+            h, state.stem_caches[1] = self.stem[2].forward_stream(
+                h, state.stem_caches[1]
+            )
+            h = self.stem[3](h).transpose(1, 2)
+            h = self.pos_enc(h, offset=state.position)
+            for index, block in enumerate(self.blocks):
+                h, state.block_histories[index] = block.forward_stream(
+                    h,
+                    state.block_histories[index],
+                    self.config.max_attention_context,
+                )
         h = self.norm(h)
         h, state.down_cache = self.down.forward_stream(
             h.transpose(1, 2),
@@ -469,11 +734,22 @@ class ContentStudent(nn.Module):
             empty = x.new_empty(x.shape[0], self.config.content_dim, 0)
             return ContentStudentOutput(content=empty), state
         hard_content = None
+        soft_fsq_content = None
         fsq_logits = None
         fsq_codes = None
+        soft_fsq_codes = None
         if self.fsq_head is not None:
-            _, hard_content, fsq_logits, fsq_codes = self._decode_fsq(h)
-            content = hard_content
+            (
+                soft_fsq_content,
+                hard_content,
+                fsq_logits,
+                fsq_codes,
+                soft_fsq_codes,
+            ) = self._decode_fsq(h)
+            if self.config.hybrid_content:
+                content = self.content_head(h)
+            else:
+                content = hard_content
         else:
             content = self.content_head(h)
         if flush:
@@ -482,9 +758,11 @@ class ContentStudent(nn.Module):
             ContentStudentOutput(
                 content=content,
                 pre_fsq=None,
+                soft_fsq_content=soft_fsq_content,
                 hard_content=hard_content,
                 fsq_logits=fsq_logits,
                 fsq_codes=fsq_codes,
+                soft_fsq_codes=soft_fsq_codes,
                 text_logits=None,
             ),
             state,
