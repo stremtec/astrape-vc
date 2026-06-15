@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="mps")
     parser.add_argument(
         "--architecture",
-        choices=("legacy", "mio_causal"),
+        choices=("legacy", "mio_causal", "mio_ffl"),
         default="legacy",
     )
     parser.add_argument("--batch-size", type=int, default=2)
@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heads", type=int)
     parser.add_argument("--attention-context-frames", type=int)
     parser.add_argument("--mio-ff-hidden", type=int)
+    parser.add_argument("--ffl-hidden", type=int, default=256)
+    parser.add_argument("--ffl-horizon", type=int, default=16)
+    parser.add_argument("--ffl-history", type=int, default=64)
+    parser.add_argument("--ffl-heads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--resume", type=Path)
@@ -50,12 +54,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.architecture == "mio_causal":
+    if args.architecture in {"mio_causal", "mio_ffl"}:
         hidden = args.hidden or 768
         layers = args.layers or 6
         heads = args.heads or 12
         attention_context = args.attention_context_frames or 125
-        run_name = args.run_name or "content_student_mio_causal_768x6"
+        default_name = (
+            "content_student_mio_ffl_768x6"
+            if args.architecture == "mio_ffl"
+            else "content_student_mio_causal_768x6"
+        )
+        run_name = args.run_name or default_name
     else:
         hidden = args.hidden or 512
         layers = args.layers or 10
@@ -70,6 +79,10 @@ def main() -> None:
         text_vocab_size=VOCAB_SIZE,
         max_attention_context=attention_context,
         mio_ff_hidden=args.mio_ff_hidden,
+        ffl_hidden=args.ffl_hidden,
+        ffl_horizon=args.ffl_horizon,
+        ffl_history=args.ffl_history,
+        ffl_heads=args.ffl_heads,
     )
     train_flat_ctc_student(
         model,

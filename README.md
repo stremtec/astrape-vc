@@ -80,6 +80,13 @@ new causal architecture before reporting causal quality.
   --full-validation-every 5 \
   --device mps
 
+# FFL content student: Mio backbone plus 16-slot layer-wise future effects
+.venv/bin/python train_content_flat_ctc.py \
+  --architecture mio_ffl \
+  --steps-per-epoch 1000 --probe-samples 1024 \
+  --full-validation-every 5 \
+  --device mps
+
 # Quality-first Mio causal training. Phase 1 is teacher-only; phase 2 samples
 # teacher-cache and original-VCTK batches at an exact 50:50 ratio.
 ./run_mio_two_phase.sh
@@ -112,11 +119,12 @@ validation, versioned checkpoints, and separate `.best.pt`/`.last.pt` files.
 The quality-first Mio causal trainer uses a direct continuous 768d content head
 and a small character-CTC auxiliary head. Phase 1 trains only against cached Mio
 teacher targets, including aligned transcript CTC. Phase 2 starts from the best
-phase-1 probe checkpoint at a lower learning rate and samples teacher-cache and
-original full-utterance VCTK batches at an exact 50:50 ratio. Original batches
-apply only weighted CTC, while Mio teacher cosine remains the checkpoint
-selection criterion. There is no random crop that would invalidate transcript
-alignment.
+phase-1 probe checkpoint at a much lower learning rate and samples teacher-cache
+and original full-utterance VCTK batches at an exact 50:50 ratio. The low phase-2
+rate protects teacher alignment when CTC-only updates alternate with direct
+distillation. Original batches apply only weighted CTC, while Mio teacher cosine
+remains the checkpoint selection criterion. There is no random crop that would
+invalidate transcript alignment.
 
 Each short epoch runs 1,000 optimizer updates and evaluates a fixed,
 speaker-balanced probe. Full speaker-disjoint validation runs every five
@@ -142,6 +150,15 @@ The configured target remains full-context Mio teacher cosine `0.99`, measured
 on the direct 768d output. Soft and hard FSQ cosine, per-axis accuracy, exact
 token accuracy, sequence cosine, and frame-cosine p05 are reported separately
 so FSQ fidelity cannot hide regressions in the deployment representation.
+
+False Future Learning (FFL) is the active zero-lookahead research path for
+closing the full-context gap. It synthesizes confidence-gated internal future
+effects from past-only states, with no audio collection delay. The oracle
+experiment, implemented `mio_ffl` content student, losses, and staged training
+plan are documented in `docs/research/false_future_learning.md`. The integrated
+FFL path adds 7.20M parameters across a shared slot generator and six
+layer-specific gated adapters. The deterministic probe can be run with
+`diagnose_false_future.py` in the Mio environment.
 
 ## VoiceBank Policy
 
@@ -228,6 +245,10 @@ Frontend latency experiments and the direct causal waveform-decoder plan are
 documented in `docs/latency_waveform_plan.md`.
 The callback, state, buffering, compatibility, and failure contracts for the
 complete runtime are documented in `docs/e2e_streaming_pipeline.md`.
+The 52.17M direct + FSQ + pre-FSQ + CTC `mio_ffl` model has numerically matching
+full and streaming paths and no future leakage in regression tests. A 768x6
+streaming call for two 50 Hz frames measured about 10.2 ms p50 and 13.5 ms p95
+on the current MPS host.
 
 On the current Apple MPS host, the selected 768x10 model with 100 past
 50 Hz frames measured 29.3 ms p50 and 30.5 ms p95 per output frame after

@@ -8,6 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .false_future import (
+    FalseFutureConfig,
+    FalseFutureLayerAdapter,
+    FalseFutureSlotGenerator,
+)
+
 
 @dataclass(frozen=True)
 class ContentStudentConfig:
@@ -30,6 +36,14 @@ class ContentStudentConfig:
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
     mio_ff_hidden: Optional[int] = None
+    ffl_hidden: int = 256
+    ffl_horizon: int = 16
+    ffl_history: int = 64
+    ffl_heads: int = 4
+    ffl_coarse_layers: int = 2
+    ffl_reverse_layers: int = 2
+    ffl_summary_layers: int = 3
+    ffl_gate_bias: float = -4.0
 
 
 @dataclass
@@ -42,6 +56,10 @@ class ContentStudentOutput:
     fsq_codes: Optional[torch.Tensor] = None
     soft_fsq_codes: Optional[torch.Tensor] = None
     text_logits: Optional[torch.Tensor] = None
+    false_future_effects: Optional[torch.Tensor] = None
+    false_future_corrections: Optional[torch.Tensor] = None
+    false_future_gates: Optional[torch.Tensor] = None
+    false_future_benefit: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -50,6 +68,7 @@ class StreamingState:
     block_histories: list[Optional[torch.Tensor]]
     down_cache: Optional[torch.Tensor] = None
     pending_mel: Optional[torch.Tensor] = None
+    false_future_history: Optional[torch.Tensor] = None
     position: int = 0
 
 
@@ -490,20 +509,31 @@ class ContentStudent(nn.Module):
 
     def __init__(self, config: ContentStudentConfig):
         super().__init__()
-        if config.architecture not in {"legacy", "mio_causal"}:
-            raise ValueError("architecture must be 'legacy' or 'mio_causal'")
+        if config.architecture not in {"legacy", "mio_causal", "mio_ffl"}:
+            raise ValueError(
+                "architecture must be 'legacy', 'mio_causal', or 'mio_ffl'"
+            )
         if config.hidden % config.n_heads:
             raise ValueError("hidden must be divisible by n_heads")
-        if config.architecture == "mio_causal" and (
+        if config.architecture in {"mio_causal", "mio_ffl"} and (
             config.hidden // config.n_heads
         ) % 2:
-            raise ValueError("mio_causal requires an even attention head dimension")
+            raise ValueError(
+                "Mio architectures require an even attention head dimension"
+            )
         if config.rope_theta <= 0:
             raise ValueError("rope_theta must be positive")
         if config.mio_ff_hidden is not None and config.mio_ff_hidden <= 0:
             raise ValueError("mio_ff_hidden must be positive when set")
         if config.max_attention_context is not None and config.max_attention_context <= 0:
             raise ValueError("max_attention_context must be positive")
+        if config.architecture == "mio_ffl":
+            if config.ffl_hidden <= 0 or config.ffl_horizon <= 0:
+                raise ValueError("FFL hidden size and horizon must be positive")
+            if config.ffl_history <= 0 or config.ffl_summary_layers <= 0:
+                raise ValueError("FFL history and summary layers must be positive")
+            if config.ffl_hidden % config.ffl_heads:
+                raise ValueError("FFL hidden size must be divisible by FFL heads")
         if config.structured_fsq and (
             not config.fsq_levels or any(level < 2 for level in config.fsq_levels)
         ):
@@ -512,7 +542,7 @@ class ContentStudent(nn.Module):
             raise ValueError("hybrid_content requires structured_fsq")
         self.config = config
         conv_type = SafeCausalConv1d if config.safe_convs else CausalConv1d
-        if config.architecture == "mio_causal":
+        if config.architecture in {"mio_causal", "mio_ffl"}:
             self.stem = nn.Sequential(
                 conv_type(config.in_dim, config.hidden, 1),
             )
@@ -535,6 +565,36 @@ class ContentStudent(nn.Module):
             )
             self.norm = nn.LayerNorm(config.hidden)
             self.down = conv_type(config.hidden, config.hidden, 3, stride=2)
+        if config.architecture == "mio_ffl":
+            false_future_config = FalseFutureConfig(
+                input_dim=config.hidden,
+                hidden_dim=config.ffl_hidden,
+                horizon=config.ffl_horizon,
+                history=config.ffl_history,
+                n_heads=config.ffl_heads,
+                coarse_layers=config.ffl_coarse_layers,
+                reverse_layers=config.ffl_reverse_layers,
+                summary_layers=config.ffl_summary_layers,
+                ff_mult=config.ff_mult,
+                dropout=config.dropout,
+                initial_gate_bias=config.ffl_gate_bias,
+            )
+            self.false_future_generator = FalseFutureSlotGenerator(
+                false_future_config
+            )
+            self.false_future_adapters = nn.ModuleList(
+                [
+                    FalseFutureLayerAdapter(
+                        config.hidden,
+                        config.ffl_hidden,
+                        config.ffl_gate_bias,
+                    )
+                    for _ in range(config.n_layers)
+                ]
+            )
+        else:
+            self.false_future_generator = None
+            self.false_future_adapters = None
         self.content_head = (
             conv_type(config.hidden, config.content_dim, 1)
             if not config.structured_fsq or config.hybrid_content
@@ -614,12 +674,32 @@ class ContentStudent(nn.Module):
         h = self.stem(x).transpose(1, 2)
         if self.pos_enc is not None:
             h = self.pos_enc(h)
+        false_future_slots = (
+            self.false_future_generator(h)
+            if self.false_future_generator is not None
+            else None
+        )
+        false_future_effects = []
+        false_future_corrections = []
+        false_future_gates = []
+        false_future_benefit = []
         padding_mask = None
         if lengths is not None:
             positions = torch.arange(h.shape[1], device=h.device)
             padding_mask = positions.unsqueeze(0) >= lengths.unsqueeze(1)
-        for block in self.blocks:
+        for index, block in enumerate(self.blocks):
             h = block(h, padding_mask)
+            if false_future_slots is not None:
+                effect, gate, benefit = self.false_future_adapters[index](
+                    h,
+                    false_future_slots,
+                )
+                correction = gate.unsqueeze(-1) * effect
+                h = h + correction
+                false_future_effects.append(effect)
+                false_future_corrections.append(correction)
+                false_future_gates.append(gate)
+                false_future_benefit.append(benefit)
         h = self.norm(h)
         text_logits = self.text_head(h) if self.text_head is not None else None
         h = self.down(h.transpose(1, 2))
@@ -652,11 +732,32 @@ class ContentStudent(nn.Module):
             fsq_codes=fsq_codes,
             soft_fsq_codes=soft_fsq_codes,
             text_logits=text_logits,
+            false_future_effects=(
+                torch.stack(false_future_effects, dim=1)
+                if false_future_effects
+                else None
+            ),
+            false_future_corrections=(
+                torch.stack(false_future_corrections, dim=1)
+                if false_future_corrections
+                else None
+            ),
+            false_future_gates=(
+                torch.stack(false_future_gates, dim=1)
+                if false_future_gates
+                else None
+            ),
+            false_future_benefit=(
+                torch.stack(false_future_benefit, dim=1)
+                if false_future_benefit
+                else None
+            ),
         )
 
     def initial_streaming_state(self) -> StreamingState:
         return StreamingState(
-            stem_caches=[None] * (2 if self.config.architecture == "legacy" else 1),
+            stem_caches=[None]
+            * (2 if self.config.architecture == "legacy" else 1),
             block_histories=[None] * len(self.blocks),
         )
 
@@ -692,12 +793,25 @@ class ContentStudent(nn.Module):
                 state.pending_mel = None
             empty = x.new_empty(x.shape[0], self.config.content_dim, 0)
             return ContentStudentOutput(content=empty), state
-        if self.config.architecture == "mio_causal":
+        false_future_slots = None
+        false_future_effects = []
+        false_future_corrections = []
+        false_future_gates = []
+        false_future_benefit = []
+        if self.config.architecture in {"mio_causal", "mio_ffl"}:
             h, state.stem_caches[0] = self.stem[0].forward_stream(
                 x,
                 state.stem_caches[0],
             )
             h = h.transpose(1, 2)
+            if self.false_future_generator is not None:
+                (
+                    false_future_slots,
+                    state.false_future_history,
+                ) = self.false_future_generator.forward_stream(
+                    h,
+                    state.false_future_history,
+                )
             for index, block in enumerate(self.blocks):
                 h, state.block_histories[index] = block.forward_stream(
                     h,
@@ -705,6 +819,17 @@ class ContentStudent(nn.Module):
                     self.config.max_attention_context,
                     position=state.position,
                 )
+                if false_future_slots is not None:
+                    effect, gate, benefit = self.false_future_adapters[index](
+                        h,
+                        false_future_slots,
+                    )
+                    correction = gate.unsqueeze(-1) * effect
+                    h = h + correction
+                    false_future_effects.append(effect)
+                    false_future_corrections.append(correction)
+                    false_future_gates.append(gate)
+                    false_future_benefit.append(benefit)
         else:
             h, state.stem_caches[0] = self.stem[0].forward_stream(
                 x, state.stem_caches[0]
@@ -764,6 +889,26 @@ class ContentStudent(nn.Module):
                 fsq_codes=fsq_codes,
                 soft_fsq_codes=soft_fsq_codes,
                 text_logits=None,
+                false_future_effects=(
+                    torch.stack(false_future_effects, dim=1)
+                    if false_future_effects
+                    else None
+                ),
+                false_future_corrections=(
+                    torch.stack(false_future_corrections, dim=1)
+                    if false_future_corrections
+                    else None
+                ),
+                false_future_gates=(
+                    torch.stack(false_future_gates, dim=1)
+                    if false_future_gates
+                    else None
+                ),
+                false_future_benefit=(
+                    torch.stack(false_future_benefit, dim=1)
+                    if false_future_benefit
+                    else None
+                ),
             ),
             state,
         )

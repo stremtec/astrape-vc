@@ -40,7 +40,7 @@ class TwoPhaseTrainingConfig:
     phase2_epochs: int = 20
     steps_per_epoch: int = 1000
     phase1_learning_rate: float = 2e-4
-    phase2_learning_rate: float = 1e-4
+    phase2_learning_rate: float = 5e-6
     weight_decay: float = 1e-5
     validation_fraction: float = 0.15
     teacher_probability: float = 0.5
@@ -287,8 +287,20 @@ def train_two_phase_student(
     )
     if config.resume is not None:
         payload = torch.load(config.resume, map_location=device)
-        optimizer.load_state_dict(payload["optimizer_state_dict"])
-        scheduler.load_state_dict(payload["scheduler_state_dict"])
+        if "optimizer_state_dict" in payload:
+            optimizer.load_state_dict(payload["optimizer_state_dict"])
+        else:
+            print(
+                "Resume checkpoint has no optimizer state; using a fresh optimizer",
+                flush=True,
+            )
+        if "scheduler_state_dict" in payload:
+            scheduler.load_state_dict(payload["scheduler_state_dict"])
+        else:
+            print(
+                "Resume checkpoint has no scheduler state; using a fresh scheduler",
+                flush=True,
+            )
 
     criterion = CTCLoss(blank=0, zero_infinity=True)
     flat_config = _flat_loss_config(config)

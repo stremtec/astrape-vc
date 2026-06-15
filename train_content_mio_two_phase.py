@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase2-epochs", type=int, default=20)
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
     parser.add_argument("--phase1-learning-rate", type=float, default=2e-4)
-    parser.add_argument("--phase2-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--phase2-learning-rate", type=float, default=5e-6)
     parser.add_argument("--teacher-probability", type=float, default=0.5)
     parser.add_argument("--teacher-ctc-weight", type=float, default=0.05)
     parser.add_argument("--original-ctc-weight", type=float, default=0.05)

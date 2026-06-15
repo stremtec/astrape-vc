@@ -14,7 +14,7 @@ mkdir -p logs
   --phase2-epochs 20 \
   --steps-per-epoch 1000 \
   --phase1-learning-rate 2e-4 \
-  --phase2-learning-rate 1e-4 \
+  --phase2-learning-rate 5e-6 \
   --teacher-probability 0.5 \
   --teacher-ctc-weight 0.05 \
   --original-ctc-weight 0.05 \
@@ -23,4 +23,5 @@ mkdir -p logs
   --full-validation-every 5 \
   --run-name content_student_mio_causal_two_phase \
   --log-every 100 \
+  "$@" \
   2>&1 | tee -a logs/content_student_mio_causal_two_phase.log
