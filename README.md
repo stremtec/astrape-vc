@@ -171,16 +171,30 @@ Multiple references are not required and are not part of the core definition.
 The target speaker may be unseen during training, so this remains zero-shot
 voice conversion.
 
-VoiceBank format v2 also stores the Mio embedding model ID, source hash,
-creation time, and non-destructive reference diagnostics for clipping,
-loudness, active speech, and DC offset. Version 1 files remain loadable.
+VoiceBank format v3 (`.astrape`) stores the Mio embedding model ID, source
+hash, creation time, and non-destructive reference diagnostics for clipping,
+loudness, active speech, and DC offset. The 48-byte fixed header is followed
+by a raw float32 LE embedding and a JSON metadata block, so profile lists
+read with a 48-byte prefix rather than decompressing a zip container.
+Version 2 `.npz` files remain readable for backward compatibility; the
+local `.astrape` migration is lossless (verified per file via
+`migrate_voicebanks.py`).
 
 ```bash
+# Build a zero-shot voice bank (default extension drives the on-disk format).
 .venv/bin/python build_voicebank.py \
   --reference target_reference.wav \
-  --output voicebanks/target.npz
+  --output voicebanks/target.astrape
 
-.venv/bin/python inspect_voicebank.py voicebanks/target.npz
+# Migrate every legacy .npz in voicebanks/ to .astrape, with verification.
+.venv/bin/python migrate_voicebanks.py --keep-existing
+.venv/bin/python migrate_voicebanks.py --move            # delete the .npz
+.venv/bin/python migrate_voicebanks.py --dry-run        # preview only
+
+# Inspect a profile (works on both .npz and .astrape).
+.venv/bin/python inspect_voicebank.py voicebanks/target.astrape
+```
+
 ```
 
 To import the historical student weights:

@@ -669,14 +669,23 @@ class ContentStudent(nn.Module):
         return torch.div(input_lengths + 1, 2, rounding_mode="floor")
 
     def forward(
-        self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+        *,
+        enable_false_future: bool = True,
+        false_future_gate_override: Optional[float] = None,
     ) -> ContentStudentOutput:
+        if false_future_gate_override is not None and not (
+            0.0 <= false_future_gate_override <= 1.0
+        ):
+            raise ValueError("false_future_gate_override must be between 0 and 1")
         h = self.stem(x).transpose(1, 2)
         if self.pos_enc is not None:
             h = self.pos_enc(h)
         false_future_slots = (
             self.false_future_generator(h)
-            if self.false_future_generator is not None
+            if self.false_future_generator is not None and enable_false_future
             else None
         )
         false_future_effects = []
@@ -694,11 +703,16 @@ class ContentStudent(nn.Module):
                     h,
                     false_future_slots,
                 )
-                correction = gate.unsqueeze(-1) * effect
+                applied_gate = (
+                    torch.full_like(gate, false_future_gate_override)
+                    if false_future_gate_override is not None
+                    else gate
+                )
+                correction = applied_gate.unsqueeze(-1) * effect
                 h = h + correction
                 false_future_effects.append(effect)
                 false_future_corrections.append(correction)
-                false_future_gates.append(gate)
+                false_future_gates.append(applied_gate)
                 false_future_benefit.append(benefit)
         h = self.norm(h)
         text_logits = self.text_head(h) if self.text_head is not None else None

@@ -1,12 +1,14 @@
 # MioCodec Content Student — Research Log
 
-> **Implementation note (2026-06-14):** The production target is now a fully
-> streaming pipeline below 100 ms with no lookahead and teacher-content cosine
-> approaching 0.99. The selected student is 768d x 10 layers with two seconds
-> of bounded causal history. It predicts MioCodec's five FSQ axes directly and
-> applies the teacher's frozen 5d-to-768d projection. Training now uses three
-> phases: original VCTK transcript CTC, a gradual original/teacher blend, and
-> teacher-heavy FSQ distillation with 10% original retention.
+> **Implementation note (2026-06-15):** The production content target is now
+> full-validation teacher cosine `>=0.920`, not `0.99`. The Mio-shaped and FFL
+> students plateaued around `0.8996`, so the next student is designed around
+> strict causal information flow rather than teacher architecture matching.
+> The current proposal uses a 50 Hz convolutional acoustic-edge encoder,
+> end-of-40 ms-cell decimation, and a 25 Hz recurrent/dual-path causal core.
+> Predicted future is retained only as an auxiliary training objective because
+> injecting it into the representation path overfit in controlled probes.
+> See `docs/research/predictive_multirate_student.md`.
 >
 > The teacher projection was recovered exactly from cached `ct` and `ce_768`
 > pairs: reconstruction max error was `2.384e-07`, and the recovered parameters

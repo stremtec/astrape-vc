@@ -160,6 +160,15 @@ class MioFalseFutureStudentTests(unittest.TestCase):
             * output.false_future_gates.unsqueeze(-1),
         )
 
+    def test_zero_gate_override_matches_causal_bypass(self):
+        model = self.small_student().eval()
+        x = torch.randn(1, 80, 12)
+        bypass = model(x, enable_false_future=False)
+        zero_gate = model(x, false_future_gate_override=0.0)
+        torch.testing.assert_close(zero_gate.content, bypass.content)
+        self.assertIsNone(bypass.false_future_gates)
+        self.assertTrue(torch.all(zero_gate.false_future_gates == 0))
+
     def test_content_loss_reaches_generator_and_gate(self):
         model = self.small_student()
         output = model(torch.randn(2, 80, 12))

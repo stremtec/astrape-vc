@@ -31,7 +31,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from astrape.streaming_pipeline import StreamingVoiceConverter
-from astrape.voicebank import VoiceBank
+from astrape.voicebank import (
+    ASTRAPE_HEADER_SIZE,
+    MIO_GLOBAL_MODEL,
+    VoiceBank,
+    detect_format,
+    header_peek,
+    open_embedding_mmap,
+    parse_astrape_header,
+)
 from astrape.wave_decoder import WaveDecoderConfig
 
 
@@ -179,34 +187,88 @@ def _training_status() -> dict[str, Any]:
 
 
 def _voicebank_payload(path: Path) -> dict[str, Any]:
-    bank = VoiceBank.load(path)
-    source = Path(bank.source_path)
+    """Build the JSON payload for one voice bank profile.
+
+    For ``.astrape`` files the embedding is read through a read-only mmap and
+    the JSON metadata is parsed only for the fields that the WebUI actually
+    surfaces. The fields that travel on the rest endpoint were selected to
+    match what non-developer users typically want to see at a glance.
+    """
+    fmt = detect_format(path)
+    header = header_peek(path)
+    source: Path | None = None
+    metadata: dict[str, Any] = {}
+    embedding_norm: float | None = None
+    if fmt == "astrape":
+        with path.open("rb") as handle:
+            raw_header = handle.read(ASTRAPE_HEADER_SIZE)
+        parsed = parse_astrape_header(raw_header)
+        handle = path.open("rb")
+        try:
+            handle.seek(parsed["metadata_offset"])
+            metadata_blob = handle.read(parsed["metadata_length"])
+        finally:
+            handle.close()
+        metadata = json.loads(metadata_blob.decode("utf-8"))
+        with open_embedding_mmap(path) as view:
+            embedding_norm = float(np.linalg.norm(view.array))
+        metadata.setdefault("embedding_model", MIO_GLOBAL_MODEL)
+    else:
+        bank = VoiceBank.load(path)
+        metadata = {
+            "duration_seconds": bank.duration_seconds,
+            "source_sample_rate": bank.source_sample_rate,
+            "embedding_model": bank.embedding_model,
+            "created_utc": bank.created_utc,
+            "peak_amplitude": bank.peak_amplitude,
+            "rms_dbfs": bank.rms_dbfs,
+            "clipping_fraction": bank.clipping_fraction,
+            "active_speech_ratio": bank.active_speech_ratio,
+            "dc_offset": bank.dc_offset,
+            "quality_warnings": list(bank.quality_warnings),
+            "reference_sha256": bank.reference_sha256,
+        }
+        embedding_norm = float(bank.global_embedding.norm())
+        source = Path(bank.source_path)
+    if source is None:
+        source = Path(str(metadata.get("source_path", "")))
     return {
         "id": path.stem,
         "file": path.name,
-        "duration_seconds": bank.duration_seconds,
-        "source_sample_rate": bank.source_sample_rate,
-        "embedding_model": bank.embedding_model,
-        "embedding_norm": float(bank.global_embedding.norm()),
-        "created_utc": bank.created_utc,
-        "peak_amplitude": bank.peak_amplitude,
-        "rms_dbfs": bank.rms_dbfs,
-        "clipping_fraction": bank.clipping_fraction,
-        "active_speech_ratio": bank.active_speech_ratio,
-        "dc_offset": bank.dc_offset,
-        "quality_warnings": list(bank.quality_warnings),
-        "has_source": source.is_file(),
-        "preview_url": f"/api/voicebanks/{path.stem}/source" if source.is_file() else None,
+        "format": fmt,
+        "version": header["version"],
+        "duration_seconds": metadata.get("duration_seconds"),
+        "source_sample_rate": metadata.get("source_sample_rate"),
+        "embedding_model": metadata.get("embedding_model"),
+        "embedding_norm": embedding_norm,
+        "created_utc": metadata.get("created_utc"),
+        "peak_amplitude": metadata.get("peak_amplitude"),
+        "rms_dbfs": metadata.get("rms_dbfs"),
+        "clipping_fraction": metadata.get("clipping_fraction"),
+        "active_speech_ratio": metadata.get("active_speech_ratio"),
+        "dc_offset": metadata.get("dc_offset"),
+        "quality_warnings": list(metadata.get("quality_warnings") or []),
+        "reference_sha256": metadata.get("reference_sha256", ""),
+        "has_source": source.is_file() if str(source) else False,
+        "preview_url": (
+            f"/api/voicebanks/{path.stem}/source" if source and source.is_file()
+            else None
+        ),
     }
 
 
 def _list_voicebanks() -> list[dict[str, Any]]:
+    seen: set[Path] = set()
+    candidates: list[Path] = []
+    for pattern in ("*.astrape", "*.npz"):
+        for path in VOICEBANK_DIR.glob(pattern):
+            if path in seen:
+                continue
+            seen.add(path)
+            candidates.append(path)
+    candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
     profiles = []
-    for path in sorted(
-        VOICEBANK_DIR.glob("*.npz"),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    ):
+    for path in candidates:
         try:
             profiles.append(_voicebank_payload(path))
         except Exception as error:
@@ -214,6 +276,7 @@ def _list_voicebanks() -> list[dict[str, Any]]:
                 {
                     "id": path.stem,
                     "file": path.name,
+                    "format": detect_format(path),
                     "error": str(error),
                     "quality_warnings": ["profile_unreadable"],
                 }

@@ -164,12 +164,16 @@ class ContentCollator:
         seed: int,
         history_mel_frames: int = 0,
         include_transcripts: bool = False,
+        pad_mel_multiple: int = 1,
     ):
         if include_transcripts and max_mel_frames is not None:
             raise ValueError("CTC transcripts require full utterances")
+        if pad_mel_multiple <= 0:
+            raise ValueError("pad_mel_multiple must be positive")
         self.max_mel_frames = max_mel_frames
         self.history_mel_frames = history_mel_frames
         self.include_transcripts = include_transcripts
+        self.pad_mel_multiple = pad_mel_multiple
         self.rng = random.Random(seed)
 
     def __call__(self, samples: list[ContentSample]) -> ContentBatch:
@@ -202,6 +206,11 @@ class ContentCollator:
             dtype=torch.long,
         )
         max_input = int(input_lengths.max())
+        max_input = (
+            (max_input + self.pad_mel_multiple - 1)
+            // self.pad_mel_multiple
+            * self.pad_mel_multiple
+        )
         max_target = int(target_lengths.max())
         mel = torch.stack(
             [F.pad(sample.mel, (0, max_input - sample.mel.shape[1])) for sample in samples]

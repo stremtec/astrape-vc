@@ -48,10 +48,17 @@ from astrape.two_phase_training import (
     validate_two_phase_config,
 )
 from astrape.voicebank import (
+    ASTRAPE_EMBEDDING_BYTES,
+    ASTRAPE_EMBEDDING_DIM,
     MIN_REFERENCE_SECONDS,
     MIO_GLOBAL_MODEL,
+    VOICEBANK_FORMAT_VERSION,
     VoiceBank,
     analyze_reference,
+    detect_format,
+    header_peek,
+    open_embedding_mmap,
+    parse_astrape_header,
 )
 from astrape.wave_decoder import (
     DirectWaveDecoder,
@@ -61,6 +68,16 @@ from astrape.wave_decoder import (
 )
 from tiers import TIERS, get_tier
 from train_wave_decoder import WaveDataset
+
+
+def _deterministic_embedding() -> torch.Tensor:
+    """128-dim reference embedding used by the astrape round-trip tests.
+
+    A fixed-seed generator guarantees that ``torch.testing.assert_close(atol=0)``
+    validates a lossless round trip rather than a tolerance-bound approximation.
+    """
+    generator = torch.Generator().manual_seed(1729)
+    return torch.randn(128, generator=generator)
 
 
 class CoreTests(unittest.TestCase):
@@ -365,6 +382,156 @@ class CoreTests(unittest.TestCase):
             migrated = VoiceBank.load(legacy)
             self.assertEqual(migrated.embedding_model, MIO_GLOBAL_MODEL)
             self.assertTrue(np.isnan(migrated.rms_dbfs))
+
+    def test_voicebank_v3_astrape_round_trip_is_lossless(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            path = directory / "profile.astrape"
+            original = VoiceBank(
+                global_embedding=_deterministic_embedding(),
+                duration_seconds=MIN_REFERENCE_SECONDS + 0.5,
+                source_sample_rate=44100,
+                source_path="/tmp/profile-reference.wav",
+                reference_sha256="a" * 64,
+                created_utc="2026-06-15T00:00:00+00:00",
+                peak_amplitude=0.85,
+                rms_dbfs=-18.0,
+                clipping_fraction=0.0,
+                active_speech_ratio=0.91,
+                dc_offset=-0.0008,
+                quality_warnings=("reference_too_loud",),
+            )
+            original.save(path)
+            self.assertEqual(detect_format(path), "astrape")
+            header = parse_astrape_header(path.read_bytes()[:48])
+            self.assertEqual(header["embedding_length"], ASTRAPE_EMBEDDING_BYTES)
+            self.assertEqual(header["embedding_length"] // 4, ASTRAPE_EMBEDDING_DIM)
+            loaded = VoiceBank.load(path)
+            torch.testing.assert_close(
+                loaded.global_embedding, original.global_embedding, atol=0, rtol=0,
+            )
+            self.assertEqual(loaded.reference_sha256, original.reference_sha256)
+            self.assertEqual(loaded.created_utc, original.created_utc)
+            self.assertEqual(loaded.quality_warnings, original.quality_warnings)
+            self.assertAlmostEqual(loaded.peak_amplitude, original.peak_amplitude)
+            self.assertAlmostEqual(loaded.rms_dbfs, original.rms_dbfs)
+            self.assertAlmostEqual(loaded.dc_offset, original.dc_offset)
+
+    def test_astrape_header_peek_is_lossless_metadata_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            path = directory / "profile.astrape"
+            bank = VoiceBank(
+                global_embedding=_deterministic_embedding(),
+                duration_seconds=6.0,
+                source_sample_rate=44100,
+                source_path="/tmp/x.wav",
+            )
+            bank.save(path)
+            peek = header_peek(path)
+            self.assertEqual(peek["format"], "astrape")
+            self.assertEqual(peek["version"], VOICEBANK_FORMAT_VERSION)
+            self.assertEqual(peek["embedding_length_bytes"], ASTRAPE_EMBEDDING_BYTES)
+            self.assertEqual(peek["embedding_dim"], ASTRAPE_EMBEDDING_DIM)
+            self.assertGreater(peek["file_size_bytes"], 0)
+
+    def test_astrape_embedding_mmap_is_zero_copy_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            path = directory / "profile.astrape"
+            torch.manual_seed(123)
+            original = VoiceBank(
+                global_embedding=torch.randn(128),
+                duration_seconds=6.0,
+                source_sample_rate=44100,
+                source_path="/tmp/x.wav",
+            )
+            original.save(path)
+            handle = open_embedding_mmap(path)
+            try:
+                self.assertEqual(handle.array.shape, (ASTRAPE_EMBEDDING_DIM,))
+                self.assertEqual(handle.array.dtype, np.float32)
+                np.testing.assert_array_equal(
+                    handle.array,
+                    original.global_embedding.numpy().astype(np.float32),
+                )
+            finally:
+                handle.close()
+
+    def test_astrape_force_format_writes_legacy_npz(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            # The legacy `.npz` writer appends `.npz` to the file name when the
+            # supplied suffix is not already `.npz`; ask explicitly for one.
+            npz_path = directory / "profile.npz"
+            bank = VoiceBank(
+                global_embedding=_deterministic_embedding(),
+                duration_seconds=6.0,
+                source_sample_rate=44100,
+                source_path="/tmp/x.wav",
+            )
+            bank.save(npz_path, force_format="npz")
+            self.assertTrue(npz_path.exists())
+            self.assertEqual(detect_format(npz_path), "npz")
+            round_trip = VoiceBank.load(npz_path)
+            torch.testing.assert_close(
+                round_trip.global_embedding, bank.global_embedding, atol=0, rtol=0,
+            )
+
+    def test_astrape_v2_npz_still_loads_losslessly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            v2_path = directory / "legacy.npz"
+            np.savez_compressed(
+                v2_path,
+                format_version=np.asarray(2, dtype=np.int64),
+                global_embedding=_deterministic_embedding().numpy(),
+                duration_seconds=np.asarray(7.0, dtype=np.float32),
+                source_sample_rate=np.asarray(44100, dtype=np.int64),
+                source_path=np.asarray("/tmp/x.wav"),
+                embedding_model=np.asarray("Aratako/MioCodec-25Hz-44.1kHz-v2"),
+                reference_sha256=np.asarray("b" * 64),
+                created_utc=np.asarray("2026-06-15T00:00:00+00:00"),
+                peak_amplitude=np.asarray(0.7, dtype=np.float32),
+                rms_dbfs=np.asarray(-18.0, dtype=np.float32),
+                clipping_fraction=np.asarray(0.0, dtype=np.float32),
+                active_speech_ratio=np.asarray(0.92, dtype=np.float32),
+                dc_offset=np.asarray(0.001, dtype=np.float32),
+                quality_warnings=np.asarray(["a"], dtype="<U"),
+            )
+            self.assertEqual(detect_format(v2_path), "npz")
+            loaded = VoiceBank.load(v2_path)
+            torch.testing.assert_close(
+                loaded.global_embedding, _deterministic_embedding(), atol=0, rtol=0,
+            )
+            self.assertEqual(loaded.reference_sha256, "b" * 64)
+            self.assertEqual(loaded.quality_warnings, ("a",))
+            peek = header_peek(v2_path)
+            self.assertEqual(peek["format"], "npz")
+            self.assertEqual(peek["version"], 2)
+            self.assertEqual(peek["embedding_dim"], ASTRAPE_EMBEDDING_DIM)
+
+    def test_astrape_mmap_rejects_bad_magic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            bad_path = directory / "broken.astrape"
+            bad_path.write_bytes(b"NOPE" + b"\x00" * 60)
+            with self.assertRaises(ValueError):
+                parse_astrape_header(bad_path.read_bytes()[:48])
+
+    def test_astrape_detect_format_writes_in_default_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            astrape_path = directory / "auto.astrape"
+            bank = VoiceBank(
+                global_embedding=_deterministic_embedding(),
+                duration_seconds=6.0,
+                source_sample_rate=44100,
+                source_path="/tmp/x.wav",
+            )
+            bank.save(astrape_path)
+            self.assertEqual(detect_format(astrape_path), "astrape")
+
 
     def test_reference_quality_detects_clipping_and_low_activity(self):
         audio = np.zeros(16000 * 6, dtype=np.float32)
