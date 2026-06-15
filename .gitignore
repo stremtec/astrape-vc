@@ -14,3 +14,8 @@ logs/
 checkpoints/
 outputs/
 data/
+
+# Markdown (all .md except README.md)
+CLAUDE.md
+*.md
+!README.md
