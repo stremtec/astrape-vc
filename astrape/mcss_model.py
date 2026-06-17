@@ -60,6 +60,9 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class McssConfig:
+    stem_bypass: bool = False  # v5: ax3/4 heads read from stem (pre-GRU)
+    use_delta: bool = False  # v7: add mel Δ + Δ² to stem
+    use_delta_post: bool = False  # v8: add mel Δ+Δ² after GRU to head input
     # Frontend
     in_dim: int = 80               # log-mel bins
     stem_dim: int = 384            # conv stem hidden dim
@@ -311,7 +314,11 @@ class McssModel(nn.Module):
         ])
         self.attn_norm = RMSNorm(dim)
 
-        # ── 5. GRU + causal depthwise smoother ──
+        # ── 5. Pre-GRU projection + GRU + causal smoother ──
+        self.pre_gru = nn.Sequential(
+            nn.Linear(dim, dim, bias=False),
+            nn.SiLU(),
+        )
         self.gru = nn.GRU(
             dim, config.gru_dim,
             num_layers=config.gru_layers,
@@ -326,9 +333,9 @@ class McssModel(nn.Module):
         # 6a. Independent per-axis pre_fsq heads (eliminates shared-Linear interference)
         self.axis_heads = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(gru_out, 64, bias=False),
+                nn.Linear(gru_out, 128, bias=False),
                 nn.SiLU(),
-                nn.Linear(64, 1, bias=True),
+                nn.Linear(128, 1, bias=True),
             )
             for _ in range(n_axes)
         ])
@@ -337,7 +344,7 @@ class McssModel(nn.Module):
         self.proj_out = nn.Linear(n_axes, config.content_dim)
 
         # 6c. Factorized ordinal head — auxiliary CE
-        self.ordinal_head = nn.Linear(gru_out, sum(config.fsq_levels))
+        self.ordinal_heads = nn.ModuleList([nn.Linear(gru_out, L, bias=True) for L in config.fsq_levels])  # was: self.ordinal_head = nn.Linear(gru_out, sum(config.fsq_levels))
 
         # 6d. Residual 768d head (wider than MCS: 384 vs 256 hidden)
         self.residual_head = nn.Sequential(
@@ -396,7 +403,7 @@ class McssModel(nn.Module):
         h = self.attn_norm(h)                                     # [B, T25, dim]
 
         # ── GRU refinement ──
-        h_gru, _ = self.gru(h)                                    # [B, T25, gru_dim]
+        h = self.pre_gru(h); h_gru, _ = self.gru(h)                                    # [B, T25, gru_dim]
         # Causal depthwise temporal smoothing
         h_out = self.post_gru_smooth(h_gru.transpose(1, 2)).transpose(1, 2)  # [B, T25, gru_dim]
 
@@ -412,7 +419,7 @@ class McssModel(nn.Module):
         pre_residual = self.proj_out(codes_quant).transpose(1, 2)  # [B, 768, T25]
 
         # 6c. Ordinal logits
-        ordinal = self.ordinal_head(h_out).transpose(1, 2)       # [B, 34, T25]
+        ordinal = torch.cat([head(h_out).transpose(1, 2) for head in self.ordinal_heads], dim=1)       # [B, 34, T25]
 
         # 6d. Residual correction
         residual = self.residual_head(h_out)                       # [B, T25, 768]
