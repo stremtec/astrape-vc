@@ -1,7 +1,9 @@
-# MCS-Trans Q2D2 — Causal Voice Conversion Encoder
+# Astrape VC — Causal Zero-Shot Voice Conversion
 
-Causal neural content encoder for zero-shot voice conversion at 44.1kHz.
-Mel → causal transformer → Q2D2 quantization → frozen MioCodec decoder.
+Real-time (<100ms), zero-shot voice conversion at 44.1kHz.
+
+**Encoder**: MCS-Trans Q2D2 — mel → causal transformer → Q2D2 quantization → 768d content.
+**Decoder**: frozen MioCodec (228M) with speaker-conditioned waveform synthesis.
 
 **Current best**: cos768=0.9215 (GRL speaker disentanglement + decoder-in-loop)
 
