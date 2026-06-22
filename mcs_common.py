@@ -25,6 +25,8 @@ class Batch:
     tokens: torch.Tensor
     mask: torch.Tensor
     speakers: list[str]
+    indices: torch.Tensor
+    crop_starts: torch.Tensor
 
 
 class MioCompactDataset(Dataset):
@@ -54,12 +56,13 @@ class ContentCollator:
         self.rng = random.Random(seed)
         self.pad_mel_multiple = pad_mel_multiple
 
-    def _crop(self, sample: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _crop(self, sample: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
         mel = sample["mel"]
         content = sample["content"]
         tokens = sample["tokens"]
+        idx = int(sample["idx"])
         if self.mel_frames is None or mel.shape[1] <= self.mel_frames:
-            return mel, content, tokens
+            return mel, content, tokens, 0, idx
 
         max_start = mel.shape[1] - self.mel_frames
         start = self.rng.randint(0, max_start)
@@ -67,17 +70,24 @@ class ContentCollator:
         mel = mel[:, start : start + self.mel_frames]
         token_start = start // 2
         token_len = math.ceil(mel.shape[1] / 2)
-        return mel, content[token_start : token_start + token_len], tokens[token_start : token_start + token_len]
+        return (
+            mel,
+            content[token_start : token_start + token_len],
+            tokens[token_start : token_start + token_len],
+            start,
+            idx,
+        )
 
     def __call__(self, samples: list[dict]) -> Batch:
         cropped = [self._crop(sample) for sample in samples]
-        max_mel = max(mel.shape[1] for mel, _, _ in cropped)
+        max_mel = max(mel.shape[1] for mel, _, _, _, _ in cropped)
         if self.pad_mel_multiple > 1:
             max_mel = ((max_mel + self.pad_mel_multiple - 1) // self.pad_mel_multiple) * self.pad_mel_multiple
-        max_tokens = max(tokens.shape[0] for _, _, tokens in cropped)
+        max_tokens = max(tokens.shape[0] for _, _, tokens, _, _ in cropped)
 
         mels, contents, tokens_out, masks = [], [], [], []
-        for mel, content, tokens in cropped:
+        crop_starts, indices = [], []
+        for mel, content, tokens, crop_start, idx in cropped:
             token_len = min(tokens.shape[0], content.shape[0])
             mels.append(F.pad(mel, (0, max_mel - mel.shape[1])))
             contents.append(F.pad(content[:token_len], (0, 0, 0, max_tokens - token_len)))
@@ -85,6 +95,8 @@ class ContentCollator:
             mask = torch.zeros(max_tokens, dtype=torch.bool)
             mask[:token_len] = True
             masks.append(mask)
+            crop_starts.append(crop_start)
+            indices.append(idx)
 
         return Batch(
             mel=torch.stack(mels),
@@ -92,6 +104,8 @@ class ContentCollator:
             tokens=torch.stack(tokens_out),
             mask=torch.stack(masks),
             speakers=[sample["speaker"] for sample in samples],
+            indices=torch.tensor(indices, dtype=torch.long),
+            crop_starts=torch.tensor(crop_starts, dtype=torch.long),
         )
 
 
@@ -375,6 +389,8 @@ def move_batch(batch: Batch, device: torch.device) -> Batch:
         tokens=batch.tokens.to(device),
         mask=batch.mask.to(device),
         speakers=batch.speakers,
+        indices=batch.indices.to(device),
+        crop_starts=batch.crop_starts.to(device),
     )
 
 
@@ -404,9 +420,12 @@ def save_checkpoint(
         "scheduler": scheduler.state_dict(),
         "epoch": epoch,
         "metrics": metrics,
-        "best_probe_cos5": best_cos,
         "args": vars(args),
     }
+    if "Q2D2" in model.__class__.__name__:
+        payload["best_probe_cos768"] = best_cos
+    else:
+        payload["best_probe_cos5"] = best_cos
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
     tmp.replace(path)

@@ -851,16 +851,18 @@ def main() -> None:
                     random.random() < args.decoder_wave_prob):
                 if True:  # no try/except - let errors surface
                     idx_in_batch = random.randrange(len(batch.speakers))
-                    spk = str(batch.speakers[idx_in_batch])
-                    spk_rows = np.where(np.array([str(s) for s in speakers]) == spk)[0]
-                    if len(spk_rows) > 0:
-                        row = int(random.choice(spk_rows))
+                    row = int(batch.indices[idx_in_batch].item())
                         src_path = Path(str(source_files[row]))
                         if src_path.exists():
                             from eval_mcs_trans_audio import load_wave, SAMPLE_RATE  # noqa: E402
                             from mcs_common import multi_resolution_stft_loss  # noqa: E402
                             orig_wave = load_wave(src_path, SAMPLE_RATE,
-                                                  max_seconds=3.0).to(device)
+                                                  max_seconds=10.0).to(device)
+                            # Crop waveform to match the EXACT mel window
+                            mel_crop_start = int(batch.crop_starts[idx_in_batch].item())
+                            wav_start = mel_crop_start * 882
+                            wav_len = int(args.mel_frames * 882)
+                            orig_wave = orig_wave[wav_start:wav_start + wav_len]
                             with torch.no_grad():
                                 feats = mio.encode(orig_wave.unsqueeze(0),
                                                   return_content=True,
