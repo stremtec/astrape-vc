@@ -852,44 +852,43 @@ def main() -> None:
                 if True:  # no try/except - let errors surface
                     idx_in_batch = random.randrange(len(batch.speakers))
                     row = int(batch.indices[idx_in_batch].item())
-                        src_path = Path(str(source_files[row]))
-                        if src_path.exists():
-                            from eval_mcs_trans_audio import load_wave, SAMPLE_RATE  # noqa: E402
-                            from mcs_common import multi_resolution_stft_loss  # noqa: E402
-                            orig_wave = load_wave(src_path, SAMPLE_RATE,
-                                                  max_seconds=10.0).to(device)
-                            # Crop waveform to match the EXACT mel window
-                            mel_crop_start = int(batch.crop_starts[idx_in_batch].item())
-                            wav_start = mel_crop_start * 882
-                            wav_len = int(args.mel_frames * 882)
-                            orig_wave = orig_wave[wav_start:wav_start + wav_len]
-                            with torch.no_grad():
-                                feats = mio.encode(orig_wave.unsqueeze(0),
-                                                  return_content=True,
-                                                  return_global=True)
-                                global_emb = feats.global_embedding.unsqueeze(0)
-                                stft_len = mio._calculate_target_stft_length(
-                                    orig_wave.numel()
-                                )
-                            content_i = output["projected"][idx_in_batch].unsqueeze(0)
-                            content_i_t = content_i.transpose(1, 2)
-                            n_frames = min(content_i.shape[1],
-                                           feats.content_embedding.shape[0])
-                            pred_wave = mio.forward_wave(
-                                content_i_t[:, :n_frames], global_emb,
-                                stft_length=stft_len,
-                            ).squeeze(0)
-                            tgt_len = min(pred_wave.shape[-1],
-                                          orig_wave.shape[-1])
-                            wave_loss = multi_resolution_stft_loss(
-                                pred_wave[:tgt_len], orig_wave[:tgt_len],
-                                decoder_n_ffts,
+                    src_path = Path(str(source_files[row]))
+                    if src_path.exists():
+                        from eval_mcs_trans_audio import load_wave, SAMPLE_RATE  # noqa: E402
+                        from mcs_common import multi_resolution_stft_loss  # noqa: E402
+                        orig_wave = load_wave(src_path, SAMPLE_RATE,
+                                              max_seconds=10.0).to(device)
+                        # Crop to match the EXACT mel window used in training
+                        mel_crop_start = int(batch.crop_starts[idx_in_batch].item())
+                        wav_start = mel_crop_start * 882
+                        wav_len = int(args.mel_frames * 882)
+                        orig_wave = orig_wave[wav_start:wav_start + wav_len]
+                        with torch.no_grad():
+                            feats = mio.encode(orig_wave.unsqueeze(0),
+                                              return_content=True,
+                                              return_global=True)
+                            global_emb = feats.global_embedding.unsqueeze(0)
+                            stft_len = mio._calculate_target_stft_length(
+                                orig_wave.numel()
                             )
-                            loss = loss + args.decoder_wave_weight * wave_loss
-                            metrics["decoder_wave"] = float(
-                                wave_loss.detach().cpu()
-                            )
-
+                        content_i = output["projected"][idx_in_batch].unsqueeze(0)
+                        content_i_t = content_i.transpose(1, 2)
+                        n_frames = min(content_i_t.shape[1],
+                                       feats.content_embedding.shape[0])
+                        pred_wave = mio.forward_wave(
+                            content_i_t[:, :n_frames], global_emb,
+                            stft_length=stft_len,
+                        ).squeeze(0)
+                        tgt_len = min(pred_wave.shape[-1],
+                                      orig_wave.shape[-1])
+                        wave_loss = multi_resolution_stft_loss(
+                            pred_wave[:tgt_len], orig_wave[:tgt_len],
+                            decoder_n_ffts,
+                        )
+                        loss = loss + args.decoder_wave_weight * wave_loss
+                        metrics["decoder_wave"] = float(
+                            wave_loss.detach().cpu()
+                        )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
