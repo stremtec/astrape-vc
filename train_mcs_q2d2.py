@@ -778,7 +778,7 @@ def main() -> None:
     decoder_n_ffts: tuple[int, ...] = ()
     if args.decoder_wave_weight > 0:
         from eval_mcs_trans_audio import load_mio, load_wave, SAMPLE_RATE  # noqa: E402
-        from train_mcs_original_calibrator import multi_resolution_stft_loss  # noqa: E402
+        from mcs_common import multi_resolution_stft_loss  # noqa: E402
         print("Loading frozen MioCodec for decoder-in-loop ...", flush=True)
         mio = load_mio(device).eval()
         for p in mio.parameters():
