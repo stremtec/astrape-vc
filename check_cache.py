@@ -1,75 +1,156 @@
-"""Validate cache file integrity before training.
+"""Cache integrity checker + auto-repair for btrv5 datasets.
 
-Checks:
-  1. All s_XXXXX.npz files are readable with expected keys
-  2. All wavlm_cnn/s_XXXXX.npy files are readable with correct dims
-  3. File count matches expected total
+Checks all NPZ and WavLM CNN cache files. Reports issues.
+With --repair, auto-regenerates broken/missing files from source audio.
 
 Usage:
-  .venv/bin/python check_cache.py               # check all
-  .venv/bin/python check_cache.py --wavlm-only   # check only WavLM CNN cache
+  .venv/bin/python check_cache.py           # check only
+  .venv/bin/python check_cache.py --repair  # check + fix broken files
+  .venv/bin/python check_cache.py --wavlm-only  # check only WavLM CNN cache
 """
-import sys,numpy as np,argparse
+import sys, warnings, logging, argparse, time
+warnings.filterwarnings('ignore'); logging.disable(logging.INFO)
+import numpy as np
 from pathlib import Path
 
-def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument('--data-dir',default='data/mio_vctk_full_compact')
-    ap.add_argument('--wavlm-only',action='store_true')
-    ap.add_argument('--npz-only',action='store_true')
-    args=ap.parse_args()
-    root=Path(args.data_dir)
-
-    meta=np.load(root/'meta.npz',allow_pickle=False)
-    n=int(meta['n_samples'])
-    expected_keys={'logmel','ce_768','ct'}
-
-    broken_npz=[];broken_wavlm=[];missing_wavlm=[]
-
+def check_npz(data_dir, repair=False, srcs=None, meta=None):
+    """Check all s_XXXXX.npz files for required keys."""
+    expected = {'logmel', 'ce_768', 'ct'}
+    n = int(meta['n_samples']) if meta else 43885
+    broken, missing_keys = [], []
+    
     for i in range(n):
-        # NPZ check
-        npz_path=root/f's_{i:05d}.npz'
-        if not args.wavlm_only:
-            try:
-                data=np.load(npz_path,allow_pickle=False)
-                missing_keys=expected_keys-set(data.keys())
-                if missing_keys:
-                    broken_npz.append((i,f'missing keys: {missing_keys}'))
-            except Exception as e:
-                broken_npz.append((i,str(e)))
-                # Delete broken file
-                npz_path.unlink(missing_ok=True)
+        path = data_dir / f's_{i:05d}.npz'
+        if not path.exists():
+            broken.append((i, 'file missing'))
+            continue
+        try:
+            data = np.load(path, allow_pickle=False)
+            missing = expected - set(data.keys())
+            if missing:
+                missing_keys.append((i, ', '.join(missing)))
+                if path.stat().st_size < 100:
+                    broken.append((i, f'too small ({path.stat().st_size}B)'))
+        except Exception as e:
+            broken.append((i, str(e)))
+            if repair and srcs is not None:
+                path.unlink(missing_ok=True)
+    
+    return broken, missing_keys
 
-        # WavLM CNN check
-        if not args.npz_only:
-            wavlm_path=root/'wavlm_cnn'/f's_{i:05d}.npy'
-            if wavlm_path.exists():
-                try:
-                    d=np.load(wavlm_path,allow_pickle=False)
-                    if d.ndim!=2 or d.shape[1]!=512:
-                        broken_wavlm.append((i,f'shape={d.shape}'))
-                except Exception as e:
-                    broken_wavlm.append((i,str(e)))
-            else:
-                missing_wavlm.append(i)
+def check_wavlm(data_dir, repair=False, srcs=None, meta=None):
+    """Check all wavlm_cnn/s_XXXXX.npy files."""
+    wavlm_dir = data_dir / 'wavlm_cnn'
+    if not wavlm_dir.exists():
+        return [(0, 'wavlm_cnn directory missing')], []
+    n = int(meta['n_samples']) if meta else 43885
+    broken, missing = [], []
+    
+    for i in range(n):
+        path = wavlm_dir / f's_{i:05d}.npy'
+        if not path.exists():
+            missing.append(i)
+            continue
+        try:
+            d = np.load(path, allow_pickle=False)
+            if d.ndim != 2 or d.shape[1] != 512:
+                broken.append((i, f'bad shape {d.shape}'))
+                if repair: path.unlink(missing_ok=True)
+            if path.stat().st_size < 100:
+                broken.append((i, f'too small ({path.stat().st_size}B)'))
+                if repair: path.unlink(missing_ok=True)
+        except Exception as e:
+            broken.append((i, str(e)))
+            if repair: path.unlink(missing_ok=True)
+    
+    return broken, missing
 
-    print(f'Checked {n} files:')
-    print(f'  Broken npz: {len(broken_npz)}')
-    if broken_npz:
-        for i,err in broken_npz[:10]:print(f'    s_{i:05d}: {err}')
-        if len(broken_npz)>10:print(f'    ... and {len(broken_npz)-10} more')
-    print(f'  Broken wavlm: {len(broken_wavlm)}')
-    if broken_wavlm:
-        for i,err in broken_wavlm[:5]:print(f'    s_{i:05d}: {err}')
-    print(f'  Missing wavlm: {len(missing_wavlm)}')
-    if missing_wavlm and len(missing_wavlm)<=10:
-        for i in missing_wavlm:print(f'    s_{i:05d}')
-    elif missing_wavlm:print(f'    s_{missing_wavlm[0]:05d} ... s_{missing_wavlm[-1]:05d}')
+def repair_files(broken, missing, data_dir, srcs):
+    """Auto-repair broken WavLM CNN cache files."""
+    if not (broken or missing):
+        return
+    print(f'\nRepairing {len(broken)} broken + {len(missing)} missing files...')
+    sys.path.insert(0, 'external/MioCodec/src')
+    from eval_mcs_trans_audio import load_mio, load_wave, SAMPLE_RATE
+    import torch
+    
+    mio = load_mio('cpu').eval()
+    fe = mio.ssl_feature_extractor.model.feature_extractor
+    wavlm_dir = data_dir / 'wavlm_cnn'
+    wavlm_dir.mkdir(exist_ok=True)
+    
+    to_fix = set()
+    for i, _ in broken:
+        to_fix.add(i)
+    for i in missing:
+        to_fix.add(i)
+    
+    fixed = 0
+    for i in sorted(to_fix):
+        try:
+            wav = load_wave(Path(str(srcs[i])), SAMPLE_RATE, max_seconds=6.0)
+            with torch.no_grad():
+                cnn, _ = fe(wav.unsqueeze(0), length=None)
+            cnn_ds = torch.nn.functional.avg_pool1d(
+                cnn.transpose(1, 2), 3, 3
+            ).transpose(1, 2).squeeze(0).cpu().numpy().astype(np.float32)
+            np.save(wavlm_dir / f's_{i:05d}.npy', cnn_ds)
+            fixed += 1
+        except Exception as e:
+            print(f'  FAILED s_{i:05d}: {e}')
+        if fixed % 100 == 0:
+            print(f'  {fixed}/{len(to_fix)}')
+    
+    print(f'  Repaired {fixed}/{len(to_fix)} files')
 
-    if broken_npz or broken_wavlm:
-        print(f'\n❌ {len(broken_npz)+len(broken_wavlm)} issues found')
-        sys.exit(1)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--data-dir', default='data/mio_vctk_full_compact')
+    ap.add_argument('--repair', action='store_true', help='Auto-repair broken files')
+    ap.add_argument('--wavlm-only', action='store_true')
+    ap.add_argument('--npz-only', action='store_true')
+    args = ap.parse_args()
+    
+    data_dir = Path(args.data_dir)
+    meta = np.load(data_dir / 'meta.npz', allow_pickle=False)
+    n = int(meta['n_samples'])
+    srcs = meta['source_files'][:n].astype(str) if args.repair else None
+    
+    t0 = time.time()
+    print(f'Checking {n} files at {data_dir}...')
+    
+    if not args.wavlm_only:
+        broken_npz, missing_npz = check_npz(data_dir, args.repair, srcs, meta)
+        print(f'  NPZ broken: {len(broken_npz)}')
+        if broken_npz:
+            for i, err in broken_npz[:5]:
+                print(f'    s_{i:05d}: {err}')
+            if len(broken_npz) > 5: print(f'    ... and {len(broken_npz) - 5} more')
+        print(f'  NPZ missing keys: {len(missing_npz)}')
     else:
-        print('\n✅ All cache files valid')
+        broken_npz, missing_npz = [], []
+    
+    if not args.npz_only:
+        broken_wl, missing_wl = check_wavlm(data_dir, args.repair, srcs, meta)
+        print(f'  WavLM broken: {len(broken_wl)}')
+        if broken_wl:
+            for i, err in broken_wl[:5]:
+                print(f'    s_{i:05d}: {err}')
+            if len(broken_wl) > 5: print(f'    ... and {len(broken_wl) - 5} more')
+        print(f'  WavLM missing: {len(missing_wl)}')
+        if missing_wl:
+            print(f'    Range: s_{min(missing_wl):05d} .. s_{max(missing_wl):05d}')
+        
+        if args.repair and (broken_wl or missing_wl):
+            repair_files(broken_wl, missing_wl, data_dir, srcs)
+    else:
+        broken_wl, missing_wl = [], []
+    
+    total = len(broken_npz) + len(broken_wl) + len(missing_wl)
+    elapsed = time.time() - t0
+    status = '✅ All clean' if total == 0 else f'⚠️ {total} issues'
+    print(f'\n{status} ({elapsed:.1f}s)')
+    return 1 if total > 0 else 0
 
-if __name__=='__main__':main()
+if __name__ == '__main__':
+    sys.exit(main())

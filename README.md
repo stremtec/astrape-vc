@@ -1,118 +1,107 @@
-# Astrape VC — Causal Zero-Shot Voice Conversion
+# Astrape-vc — Strict-Causal Zero-Shot Voice Conversion
 
-Real-time (<100ms), zero-shot voice conversion at 44.1kHz.
-
-**Encoder**: MCS-Trans Q2D2 — mel → causal transformer → Q2D2 quantization → 768d content.
-**Decoder**: frozen MioCodec (228M) with speaker-conditioned waveform synthesis.
-
-**Current best**: cos768=0.9215 (GRL speaker disentanglement + decoder-in-loop)
+Zero-lookahead neural voice conversion at 44.1kHz.  
+**Current best: cos768 = 0.934** (strict-causal, 16kHz WavLM + 7L Transformer).
 
 ## Architecture
 
 ```
-50Hz log-mel (80-dim)
-  → causal ConvNeXt frontend + skip connections
-  → 25Hz downsample
-  → 4-layer causal Transformer (dim=512, 8 heads, SwiGLU, RoPE, window=256)
-  → Q2D2 rhombic grid [9,9,9,9,9,9] = 3,048,625 codes
-  → proj_out (6→768)
-  → frozen MioCodec decoder → 44.1kHz waveform
+Mic 44.1kHz → resample(44.1k→16k) → WavLM CNN (94M, frozen, pad=0) → 50Hz
+  → Adapter(512→80, 764K) → Causal Depthwise Stem (1.4M, 8 blocks)
+  → Downsample(2×) → 25Hz → ProjIn(320→512)
+  → Causal Transformer 7L (13.8M, RoPE+SwiGLU, window=256)
+  → Q2D2 (3M codes, Rhombic[9×9]³) → content 768d @ 25Hz
+  → MioCodec Decoder (228M, frozen) → wav 44.1kHz
 ```
 
-**Parameters**: 13.3M (SwiGLU), 11.2M (SiLU)
+**Learnable: 22.3M | Frozen: 94.4M | Total algorithmic latency: ~27ms**
+
+## Key Features
+
+| Feature | Flag | Effect |
+|---------|------|--------|
+| 16kHz WavLM CNN | `--wavlm-frontend` | Replaces Mel. Exact 50Hz, proper kernel alignment. +0.02 cos |
+| Time-Shift Distillation | `--time-shift 1` | student[t]↔teacher[t-1]. +0.004~0.014 |
+| Depthwise Conv Stem | `--stem-block-type depthwise` | 8 blocks, 4.18s RF, -0.003 adaptation |
+| Causal Mel (fallback) | `--center-false` | On-the-fly center=False mel |
+| GRL Disentanglement | `--grl-weight 0.05` | Speaker stripping |
+| Forecast Heads | `--forecast-weight 0.05` | t+1,t+2 prediction |
+| Q2D2 Quantization | `--q2d2-levels 9,9,9,9,9,9` | 3M-code rhombic grid (ICML 2026) |
+
+## Experiment Results
+
+| Model | center | cos768 | usage | Notes |
+|-------|--------|--------|-------|-------|
+| **7L WavLM 16kHz** | **strict-causal** | **0.934** | 17% | ★ Best |
+| 8L WavLM 44.1kHz | strict-causal | 0.902 | 22% | misaligned kernels |
+| 8L Mel center=False | strict-causal | 0.907 | 46% | baseline |
+| 6L Mel TS | strict-causal | 0.917 | 20% | time-shift |
+| 4L Mel center=True | 23ms future | 0.911 | 38% | non-causal |
 
 ## Quick Start
 
 ```bash
-# Train with best config (Q2D2 + RoPE + SwiGLU + GRL + decoder-loop)
+# Train with 16kHz WavLM frontend (best config)
 .venv/bin/python train_mcs_q2d2.py \
-  --device mps \
-  --epochs 10 --steps-per-epoch 2000 --batch-size 4 \
-  --n-layers 4 --trans-dim 512 --n-heads 8 --ffn-dim 1024 --window 256 \
-  --rope --swiglu \
+  --device mps --epochs 30 --steps-per-epoch 2000 --batch-size 2 \
+  --n-layers 7 --trans-dim 512 --n-heads 8 --ffn-dim 1024 --window 256 \
+  --rope --swiglu --stem-block-type depthwise \
   --q2d2-grid rhombic --q2d2-levels 9,9,9,9,9,9 --q2d2-dim 6 \
+  --wavlm-frontend --time-shift 1 \
   --content-cos-weight 1.0 --content-l1-weight 0.5 --delta-weight 0.04 \
-  --decoder-wave-weight 0.15 --decoder-wave-prob 0.3 \
-  --grl-weight 0.1 --val-fraction 0.05 \
-  --lr 5e-5 --mel-frames 200 --eval-mel-frames 300 \
-  --log-every 200 --save-every-epoch --seed 42 \
-  --out-dir checkpoints/mcs_trans_q2d2 \
-  --run-name mcs_trans_q2d2
+  --forecast-weight 0.05 --voiced-boost 1.5 --grl-weight 0.05 --grl-num-speakers 108 \
+  --lr 1e-4 --mel-frames 200 --eval-mel-frames 300 \
+  --val-fraction 0.05 --probe-samples 256 --log-every 100 --save-every-epoch \
+  --out-dir checkpoints/my_run --run-name my_run
 
-# Resume from checkpoint
+# Resume
 .venv/bin/python train_mcs_q2d2.py \
-  --resume-from checkpoints/mcs_trans_q2d2/mcs_trans_q2d2.best.pt \
-  --epochs 20 ...
+  --resume-from checkpoints/my_run/my_run.best.pt --lr 2e-5 --epochs 60 ...
 
-# Init from existing checkpoint (loads conv+transformer, Q2D2 head fresh)
-.venv/bin/python train_mcs_q2d2.py \
-  --init-from checkpoints/mcs_trans_q2d2_rope_swiglu.best.pt \
-  --rope --swiglu --grl-weight 0.1 ...
+# VC Inference
+.venv/bin/python3 -c "
+from train_mcs_q2d2 import MCSTransQ2D2Config,MCSTransQ2D2
+from eval_mcs_trans_audio import load_mio,load_wave
+from astrape.voicebank import VoiceBank
+...
+"
 ```
 
-## Experiment Results
+## Prerequisites
 
-| Experiment | cos768 | Q2D2 usage | Key change |
-|------------|--------|------------|------------|
-| rope_swiglu (4L) | 0.9114 | 39.3% | RoPE + SwiGLU |
-| + GRL | 0.9106 | 37.7% | Speaker disentanglement (grl_acc=0) |
-| + decoder-loop | 0.9215+ | in progress | Waveform loss fine-tuning |
-
-All trained on VCTK (43,885 utterances, 108 speakers), val_fraction=0.05.
+- Extract WavLM cache (one-time, ~60 min):
+  ```bash
+  .venv/bin/python cache_wavlm_16k.py
+  ```
+- Verify cache integrity:
+  ```bash
+  .venv/bin/python check_cache.py --wavlm-only
+  ```
 
 ## Project Structure
 
 ```
-train_mcs_q2d2.py                   ★ Main training (Q2D2 + RoPE + SwiGLU + GRL + decoder-loop)
-train_mcs_trans.py                  FSQ baseline (comparison)
-mcs_q2d2.py                         Q2D2 quantizer (ICML 2026)
-mcs_common.py                       Dataset, causal conv, checkpoint utilities
-eval_mcs_trans_audio.py             VC evaluation + MioCodec loading
-train_mcs_original_calibrator.py    MR-STFT loss function
+train_mcs_q2d2.py        ★ Main training (Q2D2 + RoPE + SwiGLU + GRL + WavLM)
+mcs_common.py             CausalConv1d, DepthwiseResidualBlock, dataset
+mcs_q2d2.py               Q2D2 quantizer (ICML 2026)
+cf_finetune.py             Center=False adaptation
+astrape_vc.py              Streaming VC evaluation
+check_cache.py             Cache integrity checker
+cache_wavlm_16k.py         16kHz WavLM CNN cache extraction
+eval_mcs_trans_audio.py    VC evaluation
+ARCHITECTURE.md            Full architecture diagram
+tests/                     Test scripts
 
-astrape/
-  voicebank.py                      .astrape VoiceBank format (v3)
-
-docs/
-  README.md                         This document
-
-checkpoints/  → /Volumes/UNTITLED/btrv5_checkpoints/
-data/         → /Volumes/UNTITLED/btrv5_data/
-outputs/      → /Volumes/UNTITLED/btrv5_outputs/
+data/mio_vctk_full_compact/   VCTK dataset (npz cache)
+data/mio_vctk_full_compact/wavlm_16k/   16kHz WavLM CNN cache (14GB)
+checkpoints/ → /Volumes/UNTITLED/btrv5_checkpoints/
 ```
-
-## Key Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--rope` | off | Rotary Position Embedding |
-| `--swiglu` | off | SwiGLU FFN (gated SiLU) |
-| `--grl-weight` | 0.0 | GRL speaker disentanglement (~0.1) |
-| `--decoder-wave-weight` | 0.0 | MR-STFT waveform loss (~0.15) |
-| `--decoder-wave-prob` | 0.5 | Fraction of steps with waveform loss |
-| `--q2d2-grid` | rhombic | Grid: rhombic, hexagon, rectangle |
-| `--q2d2-levels` | 7,7,7,7,7,7 | Per-dimension quantization levels |
-| `--val-fraction` | 0.15 | Validation split (0.05 for more data) |
-
-## Requirements
-
-Python 3.11+, PyTorch 2.2+, torchaudio, soundfile, numpy.
-MioCodec weights auto-downloaded from HuggingFace.
 
 ## References
 
-### Core Architecture
-- **MioCodec** — [Aratako/MioCodec-25Hz-44.1kHz-v2](https://huggingface.co/Aratako/MioCodec-25Hz-44.1kHz-v2) (HuggingFace)
-- **Q2D2** — [Two-Dimensional Quantization for Geometry-Aware Audio Coding](https://arxiv.org/abs/2512.01537) (ICML 2026)
-- **FSQ** — [Finite Scalar Quantization: VQ-VAE Made Simple](https://arxiv.org/abs/2309.15505) (2023)
-- **WavTokenizer** — [arxiv.org/abs/2401.03078](https://arxiv.org/abs/2401.03078) (2024)
-
-### Disentanglement & VC
-- **Gradient Reversal (GRL)** — [Unsupervised Domain Adaptation by Backpropagation](https://arxiv.org/abs/1409.7495) (ICML 2015)
-- [arxiv.org/abs/2604.12456](https://arxiv.org/abs/2604.12456)
-- [arxiv.org/abs/2602.00594](https://arxiv.org/abs/2602.00594)
-- [aclanthology.org/2024.findings-acl.681/](https://aclanthology.org/2024.findings-acl.681/)
-
-### Audio Generation & Codecs
-- [arxiv.org/abs/2110.01900](https://arxiv.org/abs/2110.01900)
-- [arxiv.org/abs/2202.01855](https://arxiv.org/abs/2202.01855)
+- **Q2D2**: Shuster & Nachmani, "Two-Dimensional Quantization for Geometry-Aware Audio Coding", ICML 2026
+- **MioCodec**: Aratako/MioCodec-25Hz-44.1kHz-v2 (HuggingFace)
+- **WavLM**: Chen et al., 2022
+- **GRL**: Ganin & Lempitsky, ICML 2015
+- **ConvNeXt**: Liu et al., CVPR 2022
+- **WavTokenizer**: Ji et al., 2024

@@ -28,7 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, "external/MioCodec/src")
@@ -79,6 +79,20 @@ class MCSTransQ2D2Config:
     grl_weight: float = 0.0          # 0 = disabled, ~0.1 is a good start
     grl_num_speakers: int = 0        # set automatically from dataset
     use_wavlm_frontend: bool = False  # use WavLM CNN instead of Mel
+    # ── recovered features ──
+    delta2_weight: float = 0.0       # 2nd-order temporal smoothness
+    contrastive_weight: float = 0.0  # InfoNCE contrastive loss
+    contrastive_tau: float = 0.1     # InfoNCE temperature
+    ssl_weight: float = 0.0          # WavLM multi-target distillation
+    ssl_layers: tuple[int, ...] = (0, 4, 8)  # WavLM layer targets
+    # Mamba / SSM (replaces trailing transformer layers)
+    mamba_layers: int = 0
+    mamba_d_state: int = 16
+    # Gumbel-Softmax Q2D2 relaxation annealing (0 = disabled)
+    q2d2_gumbel_start: float = 0.0
+    q2d2_gumbel_end: float = 0.0
+    # WavLM frontend adapter dims
+    wavlm_in_dim: int = 512
 
 
 # ─────────────────────────────────────────────
@@ -277,6 +291,126 @@ class TransformerBlock(nn.Module):
 
 
 # ─────────────────────────────────────────────
+# Mamba / SSM block (conditional fallback)
+# ─────────────────────────────────────────────
+
+def _mamba_available() -> bool:
+    """True only if mamba_ssm is importable AND MPS is not active.
+
+    The spec records selective_scan as unstable on MPS, so we fall back to a
+    pure-torch SSM approximation on Apple Silicon (and anywhere mamba_ssm is
+    missing).
+    """
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return False
+    try:
+        import mamba_ssm  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+class MambaBlock(nn.Module):
+    """Selective state-space block with conditional fallback.
+
+    If mamba_ssm is available and the device supports it, uses the real
+    Mamba module.  Otherwise falls back to a pure-torch selective SSM
+    approximation (causal, no external dependency), so the feature is
+    usable everywhere including MPS / CPU.
+    """
+
+    def __init__(self, dim: int, d_state: int = 16, dropout: float = 0.0):
+        super().__init__()
+        self.dim = dim
+        self.d_state = d_state
+        self.dropout_p = dropout
+        self._use_native = _mamba_available()
+
+        if self._use_native:
+            from mamba_ssm import Mamba
+            self.mamba = Mamba(
+                d_model=dim, d_state=d_state, expand=1,
+            )
+        else:
+            # ── pure-torch selective SSM approximation ──
+            self.norm = nn.LayerNorm(dim)
+            self.in_proj = nn.Linear(dim, dim, bias=False)
+            # input-dependent gates (selectivity)
+            self.gate = nn.Linear(dim, dim, bias=False)
+            # A (decay), B, C, D (skip) parameters
+            self.A_log = nn.Parameter(torch.zeros(d_state))
+            self.B_proj = nn.Linear(dim, d_state, bias=False)
+            self.C_proj = nn.Linear(dim, d_state, bias=False)
+            self.D = nn.Parameter(torch.ones(1))
+            self.out_proj = nn.Linear(dim, dim, bias=False)
+
+    def _fallback_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Causal selective scan in pure torch (RNN-like recurrence)."""
+        residual = x
+        h = self.norm(x)
+        u = self.in_proj(h)                       # (B, T, D)
+        g = torch.sigmoid(self.gate(h))           # selectivity gate
+        u = u * g
+        B_, T_, D_ = u.shape
+        S = self.d_state
+
+        A = -torch.exp(self.A_log)                # (S,) negative for decay
+        b = self.B_proj(u)                        # (B, T, S)
+        c = self.C_proj(u)                        # (B, T, S)
+
+        # per-channel state: (B, S, D)
+        state = u.new_zeros(B_, S, D_)
+        ys: list[torch.Tensor] = []
+        A_decay = torch.exp(A)                    # (S,)
+        for t in range(T_):
+            # b_t: (B, S)  u_t: (B, D) → update: (B, S, D)
+            update = b[:, t].unsqueeze(-1) * u[:, t].unsqueeze(-2)   # (B,S,1)*(B,1,D)
+            state = state * A_decay.view(1, S, 1) + update           # (B, S, D)
+            # c_t: (B, S)  → output: (B, D)
+            y_t = (c[:, t].unsqueeze(-1) * state).sum(dim=1)         # (B, D)
+            ys.append(y_t.unsqueeze(1))
+        y = torch.cat(ys, dim=1)                  # (B, T, D)
+        y = y + self.D * u                        # skip connection
+        out = self.out_proj(y)
+        return residual + F.dropout(out, self.dropout_p, self.training)
+
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        # extra args (attn_mask, kpm) are accepted but ignored by SSM.
+        if self._use_native:
+            return x + F.dropout(self.mamba(x), self.dropout_p, self.training)
+        return self._fallback_forward(x)
+
+
+# ─────────────────────────────────────────────
+# WavLM CNN frontend adapter
+# ─────────────────────────────────────────────
+
+class WavLMFrontendAdapter(nn.Module):
+    """Projects cached WavLM CNN features (512d @ ~46Hz) to mel-like 80d.
+
+    The cache (cache_wavlm_cnn.py) stores 'wavlm_cnn' as (T, 512) float32,
+    produced by MioCodec's WavLM feature_extractor → avg_pool(k=3, s=3).
+    This adapter makes that feature usable as the encoder input in place of
+    the 80-dim log-mel.
+    """
+
+    def __init__(self, in_dim: int = 512, out_dim: int = 80,
+                 hidden: int = 256, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, 512) → (B, T, 80)
+        return self.net(x)
+
+
+
+# ─────────────────────────────────────────────
 # MCS-Trans with Q2D2 quantizer
 # ─────────────────────────────────────────────
 
@@ -320,13 +454,22 @@ class MCSTransQ2D2(nn.Module):
         )
 
         # ── transformer (with optional RoPE + SwiGLU) ──
-        self.trans_layers = nn.ModuleList([
+        # Hybrid: leading layers are TransformerBlock, trailing layers may be
+        # Mamba/SSM blocks (--mamba-layers).
+        n_mamba = max(0, min(config.mamba_layers, config.n_layers))
+        n_trans = config.n_layers - n_mamba
+        layers: list[nn.Module] = [
             TransformerBlock(config.trans_dim, config.n_heads,
                              config.ffn_dim, config.dropout,
                              use_rope=config.use_rope,
                              use_swiglu=config.use_swiglu)
-            for _ in range(config.n_layers)
-        ])
+            for _ in range(n_trans)
+        ]
+        layers += [
+            MambaBlock(config.trans_dim, config.mamba_d_state, config.dropout)
+            for _ in range(n_mamba)
+        ]
+        self.trans_layers = nn.ModuleList(layers)
         self.norm = nn.LayerNorm(config.trans_dim)
         self.smooth = CausalConv1d(
             config.trans_dim, config.trans_dim, kernel_size=3,
@@ -342,14 +485,28 @@ class MCSTransQ2D2(nn.Module):
             vq_type=config.q2d2_grid,
             noise_dropout=config.q2d2_noise_dropout,
             use_l2_norm=config.q2d2_l2_norm,
+            gumbel_temperature=max(config.q2d2_gumbel_start, 0.0),
         )
 
         # ── optional WavLM frontend adapter ──
-        self.wavlm_adapter = None
+        self.use_wavlm_frontend = config.use_wavlm_frontend
+        if self.use_wavlm_frontend:
+            self.wavlm_adapter: nn.Module | None = WavLMFrontendAdapter(
+                in_dim=config.wavlm_in_dim, out_dim=config.in_dim,
+                dropout=config.dropout,
+            )
+        else:
+            self.wavlm_adapter = None
 
         # ── forecast heads: predict teacher[t+1], teacher[t+2] ──
         self.forecast_head_1 = nn.Linear(config.trans_dim, config.content_dim)
         self.forecast_head_2 = nn.Linear(config.trans_dim, config.content_dim)
+
+        # ── SSL distillation projection heads (one per WavLM layer target) ──
+        self.ssl_heads = nn.ModuleList([
+            nn.Linear(config.trans_dim, config.content_dim)
+            for _ in config.ssl_layers
+        ])
 
         # ── optional GRL speaker classifier ──
         self.speaker_classifier: SpeakerClassifier | None = None
@@ -362,6 +519,19 @@ class MCSTransQ2D2(nn.Module):
     def forward(
         self, mel: torch.Tensor, padding_mask: torch.Tensor | None = None,
     ) -> dict:
+        # ── optional WavLM frontend ──
+        # When enabled, expects cached WavLM CNN features (B, 512, T).
+        # Adapter projects 512 → 80 → conv stem.
+        if self.wavlm_adapter is not None:
+            if mel.shape[1] != self.config.wavlm_in_dim:
+                raise RuntimeError(
+                    f"WavLM frontend expects input dim {self.config.wavlm_in_dim}, "
+                    f"got {mel.shape[1]}. Ensure WavLMFrontendDataset is wrapping "
+                    f"the base dataset and all samples have 'wavlm_cnn' cache."
+                )
+            mel = self.wavlm_adapter(mel.transpose(1, 2)).transpose(1, 2)
+# 16kHz pipeline: native 50Hz, no interpolation needed
+
         # ── conv frontend ──
         h = F.silu(self.input_conv(mel))
         for block in self.blocks:
@@ -395,12 +565,94 @@ class MCSTransQ2D2(nn.Module):
             "ordinal": None,
             "forecast_1": fc1.transpose(1, 2),        # (B, 768, T)
             "forecast_2": fc2.transpose(1, 2),
+            "hidden": h.transpose(1, 2),              # (B, trans_dim, T) — SSL distill
         }
 
 
 # ─────────────────────────────────────────────
 # Q2D2-aware losses
 # ─────────────────────────────────────────────
+
+def contrastive_loss(
+    pred_768: torch.Tensor,
+    tgt_768: torch.Tensor,
+    mask: torch.Tensor,
+    tau: float = 0.1,
+) -> torch.Tensor:
+    """InfoNCE contrastive loss to prevent content centroid hedging.
+
+    For each frame, the positive is the matching teacher frame; all other
+    frames in the batch are negatives.  Operates per-frame over masked
+    positions only.
+
+    Args:
+        pred_768: (B, 768, L) student projected content.
+        tgt_768: (B, L, 768) teacher content.
+        mask: (B, L) bool mask of valid frames.
+        tau: temperature.
+
+    Returns:
+        scalar contrastive loss.
+    """
+    pred = pred_768.permute(0, 2, 1)[mask]            # (N, 768)
+    tgt = tgt_768[mask]                                 # (N, 768)
+    if pred.shape[0] < 2:
+        return pred.sum() * 0.0
+    pred_n = F.normalize(pred, dim=-1)
+    tgt_n = F.normalize(tgt, dim=-1)
+    # (N, N) similarity; diagonal = positive
+    sim = pred_n @ tgt_n.t() / tau
+    labels = torch.arange(pred.shape[0], device=pred.device)
+    return F.cross_entropy(sim, labels)
+
+
+def ssl_distill_loss(
+    hidden: torch.Tensor | None,
+    batch: Batch,
+    mask: torch.Tensor,
+    ssl_heads: nn.ModuleList | None,
+    ssl_layers: tuple[int, ...] = (0, 4, 8),
+    ts: int = 0,
+) -> torch.Tensor:
+    """WavLM multi-target distillation (Mimi-style).
+
+    The student's pre-quantization hidden state is projected through
+    ``ssl_heads`` (one per target layer) and matched to the cached WavLM
+    layer outputs by cosine similarity.
+
+    Args:
+        hidden: (B, trans_dim, T) student pre-quantization state.
+        batch: training batch carrying ssl_L* targets.
+        mask: (B, L) valid-frame mask.
+        ssl_heads: ModuleList of Linear(trans_dim → 768), one per target.
+        ssl_layers: which WavLM layers to target (used to build attr names).
+        ts: time-shift offset.
+
+    Returns:
+        scalar distillation loss (mean of 1 - cos over masked frames & layers).
+    """
+    if hidden is None or ssl_heads is None or len(ssl_heads) == 0:
+        return torch.tensor(0.0, device=hidden.device if hidden is not None else "cpu")
+    h = hidden[:, :, ts:ts + mask.shape[1]].permute(0, 2, 1)  # (B, L, trans_dim)
+    L = h.shape[1]
+    ssl_keys = [f"ssl_L{lv}" for lv in ssl_layers[:len(ssl_heads)]]
+    cos_terms: list[torch.Tensor] = []
+    for head, k in zip(ssl_heads, ssl_keys):
+        tgt = getattr(batch, k, None)
+        if tgt is None or tgt.numel() == 0:
+            continue
+        tgt = tgt[:, :L]                                   # (B, L, 768)
+        pred = head(h)                                     # (B, L, 768)
+        a = F.normalize(pred, dim=-1)
+        b = F.normalize(tgt, dim=-1)
+        cos = (a * b).sum(dim=-1)                          # (B, L)
+        cos_terms.append(
+            (1.0 - cos * mask.float()).sum() / mask.float().sum().clamp(min=1)
+        )
+    if not cos_terms:
+        return hidden.sum() * 0.0
+    return torch.stack(cos_terms).mean()
+
 
 def q2d2_losses(
     output: dict,
@@ -410,6 +662,8 @@ def q2d2_losses(
     speaker_classifier: nn.Module | None = None,
     speaker_ids: torch.Tensor | None = None,
     time_shift: int = 0,
+    ssl_heads: nn.ModuleList | None = None,
+    ssl_layers: tuple[int, ...] = (0, 4, 8),
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute losses for Q2D2 quantized output.
 
@@ -434,7 +688,8 @@ def q2d2_losses(
     length = min(projected.shape[2] - ts, batch.content.shape[1] - ts,
                  batch.mask.shape[1] - ts)
     if length < 2:
-        return projected.sum() * 0.0, {"cos768": 0.0}
+        zero = projected.sum() * 0.0
+        return zero, {"loss": float(zero.detach().cpu()), "cos768": 0.0}
     mask = batch.mask[:, ts:ts + length]
 
     # ── time-shifted alignment ──
@@ -474,10 +729,22 @@ def q2d2_losses(
     else:
         delta = projected.sum() * 0.0
 
+    # ── delta2 (2nd-order temporal smoothness) ──
+    delta2 = projected.sum() * 0.0
+    if length >= 3:
+        d2_mask = mask[:, 2:] & mask[:, 1:-1] & mask[:, :-2]
+        if d2_mask.any():
+            pred_d2 = pred_flat[:, 2:] - 2 * pred_flat[:, 1:-1] + pred_flat[:, :-2]
+            tgt_d2 = tgt_768[:, 2:] - 2 * tgt_768[:, 1:-1] + tgt_768[:, :-2]
+            delta2 = F.smooth_l1_loss(
+                pred_d2[d2_mask], tgt_d2[d2_mask], reduction="mean"
+            )
+
     # ── total loss ──
     loss = (args.content_cos_weight * cos768_loss +
             args.content_l1_weight * content_l1 +
-            args.delta_weight * delta)
+            args.delta_weight * delta +
+            getattr(args, "delta2_weight", 0.0) * delta2)
 
     # ── forecast loss ──
     forecast_weight = getattr(args, "forecast_weight", 0.0)
@@ -514,27 +781,43 @@ def q2d2_losses(
                 (speaker_logits.argmax(dim=-1) == speaker_ids).float().mean().cpu()
             )
 
+    # ── InfoNCE contrastive loss ──
+    contrastive_loss_val: float = 0.0
+    contrastive_weight = getattr(args, "contrastive_weight", 0.0)
+    if contrastive_weight > 0:
+        c_loss = contrastive_loss(
+            pred_768, tgt_768, mask,
+            tau=getattr(args, "contrastive_tau", 0.1),
+        )
+        contrastive_loss_val = float(c_loss.detach().cpu())
+        loss = loss + contrastive_weight * c_loss
+
+    # ── WavLM SSL multi-target distillation ──
+    ssl_loss_val: float = 0.0
+    ssl_weight = getattr(args, "ssl_weight", 0.0)
+    if ssl_weight > 0:
+        hidden = output.get("hidden")              # (B, trans_dim, T)
+        s_loss = ssl_distill_loss(hidden, batch, mask, ssl_heads, ssl_layers, ts)
+        ssl_loss_val = float(s_loss.detach().cpu())
+        loss = loss + ssl_weight * s_loss
+
     # ── metrics ──
     metrics: dict[str, float] = {
         "loss": float(loss.detach().cpu()),
         "cos768": float(cos768.detach().cpu()),
         "content_l1": float(content_l1.detach().cpu()),
         "delta": float(delta.detach().cpu()),
+        "delta2": float(delta2.detach().cpu()),
         "grl_loss": grl_loss_val,
         "grl_acc": grl_acc_val,
         "forecast_loss": forecast_loss_val,
+        "contrastive_loss": contrastive_loss_val,
+        "ssl_loss": ssl_loss_val,
     }
 
     # Q2D2 utilization stats (diagnostic, no gradient)
     if quantizer is not None and q2d2_codes is not None:
         with torch.no_grad():
-            # q2d2_codes are already in [-1,1] range, feed through quantizer's
-            # project_in path to get per-pair utilization
-            z = quantizer.project_in(q2d2_codes)
-            _, _, nearest = quantizer.forward_with_nearest(
-                torch.randn_like(q2d2_codes)  # dummy, we just want the grid snap
-            )
-            # Actually, use the q2d2 codes directly
             stats = compute_q2d2_perplexity(quantizer, q2d2_codes)
             metrics["q2d2_usage"] = stats["overall_usage"]
             for i in range(quantizer.num_pairs):
@@ -546,6 +829,75 @@ def q2d2_losses(
 # ─────────────────────────────────────────────
 # Evaluation
 # ─────────────────────────────────────────────
+
+class CenterFalseMelWrapper(Dataset):
+    """Wraps a base dataset, recomputing mel from raw audio with center=False."""
+
+    SAMPLE_RATE = 44100
+
+    def __init__(self, base, srcs):
+        self.base = base
+        self.src = srcs
+
+    def __len__(self): return len(self.base)
+
+    def __getitem__(self, idx):
+        import soundfile as sf
+        import torchaudio
+
+        sample = self.base[idx]
+        si = int(sample['idx'])
+        w, sr = sf.read(str(Path(self.src[si])), dtype='float32')
+        w = torch.from_numpy(np.asarray(w))
+        if w.ndim == 2:
+            w = w.mean(1)
+        if sr != self.SAMPLE_RATE:
+            w = torchaudio.functional.resample(
+                w.unsqueeze(0), sr, self.SAMPLE_RATE
+            ).squeeze(0)
+        mel = torchaudio.transforms.MelSpectrogram(
+            self.SAMPLE_RATE, 2048, 882, n_mels=80, f_min=0.0,
+            f_max=self.SAMPLE_RATE / 2.0, power=1, center=False,
+        )(w.unsqueeze(0))
+        mel = torch.log(torch.clamp(mel, min=1e-5))
+        sample['mel'] = mel[0]
+        return sample
+
+
+class WavLMFrontendDataset(Dataset):
+    """Replaces 'mel' with cached WavLM CNN features (cache_wavlm_cnn.py).
+
+    The npz cache stores 'wavlm_cnn' as (T, 512) float32 at ~46 Hz.
+    We transpose to (512, T) so ContentCollator treats the second dim
+    (time) correctly for cropping/padding.
+
+    ContentCollator's mel_frames then controls the number of WavLM
+    output frames to keep, just like for mel.
+    """
+
+    def __init__(self, base: Dataset, data_dir: Path):
+        self.base = base
+        self.data_dir = data_dir
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        sample = self.base[idx]
+        si = int(sample['idx'])
+        # Load cached WavLM CNN from .npy file
+        cnn_path = self.data_dir / 'wavlm_16k' / f's_{si:05d}.npy'
+        if not cnn_path.exists():
+            raise RuntimeError(
+                f"WavLM frontend: sample s_{si:05d} has no wavlm_cnn cache. "
+                f"Re-run cache_wavlm_cnn.py or disable --wavlm-frontend."
+            )
+        cnn = np.load(cnn_path, allow_pickle=False)
+        # wavlm_cnn: (T, 512) → transpose → (512, T)
+        sample['mel'] = torch.from_numpy(cnn.astype(np.float32)).t()
+        return sample
+
+
 
 @torch.inference_mode()
 def evaluate(
@@ -569,7 +921,9 @@ def evaluate(
         output = model(batch.mel, padding_mask=batch.mask)
         _, metrics = q2d2_losses(output, batch, args, quantizer,
                                  model.speaker_classifier, speaker_ids,
-                                 time_shift=args.time_shift)
+                                 time_shift=args.time_shift,
+                                 ssl_heads=model.ssl_heads,
+                                 ssl_layers=model.config.ssl_layers)
         for key, value in metrics.items():
             buckets.setdefault(key, []).append(value)
     model.train()
@@ -646,6 +1000,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--q2d2-grid", default="rhombic",
                    choices=["rhombic", "hexagon", "rectangle"],
                    help="2D grid geometry type.")
+    p.add_argument("--q2d2-l2-norm", action="store_true",
+                   help="L2-normalize Q2D2 feature pairs before grid snap.")
 
     # Loss weights
     p.add_argument("--content-cos-weight", type=float, default=1.0,
@@ -671,8 +1027,6 @@ def parse_args() -> argparse.Namespace:
                    help="Conv stem block type.")
     p.add_argument("--center-false", action="store_true",
                    help="Compute center=False mel on-the-fly from raw audio.")
-    p.add_argument("--voiced-boost", type=float, default=1.0,
-                   help="Voiced frame weight multiplier.")
 
     # Decoder-in-loop (original audio feedback)
     p.add_argument("--decoder-wave-weight", type=float, default=0.0,
@@ -681,6 +1035,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decoder-wave-prob", type=float, default=0.5,
                    help="Fraction of steps that compute decoder wave loss.")
     p.add_argument("--decoder-n-ffts", default="512,1024,2048")
+
+    # ── recovered features ──
+    p.add_argument("--delta2-weight", type=float, default=0.0,
+                   help="Weight on 2nd-order temporal smoothness.")
+    p.add_argument("--contrastive-weight", type=float, default=0.0,
+                   help="Weight on InfoNCE contrastive loss.")
+    p.add_argument("--contrastive-tau", type=float, default=0.1,
+                   help="InfoNCE temperature τ.")
+    p.add_argument("--ssl-weight", type=float, default=0.0,
+                   help="Weight on WavLM multi-target distillation (L0,L4,L8).")
+    p.add_argument("--ssl-layers", default="0,4,8",
+                   help="Comma-separated WavLM layer targets for SSL distillation.")
+    p.add_argument("--mamba-layers", type=int, default=0,
+                   help="Number of trailing layers replaced by Mamba/SSM.")
+    p.add_argument("--mamba-d-state", type=int, default=16,
+                   help="Mamba SSM state dimension (d_state).")
+    p.add_argument("--q2d2-gumbel-start", type=float, default=0.0,
+                   help="Initial Gumbel temperature for Q2D2 relaxation.")
+    p.add_argument("--q2d2-gumbel-end", type=float, default=0.0,
+                   help="Final Gumbel temperature for Q2D2 relaxation (anneal).")
+    p.add_argument("--wavlm-frontend", action="store_true",
+                   help="Use cached WavLM CNN features instead of mel.")
 
     return p.parse_args()
 
@@ -716,27 +1092,38 @@ def main() -> None:
     train_idx, val_idx = split_by_speaker(speakers, args.val_fraction, args.seed)
     probe_idx = speaker_balanced_subset(val_idx, speakers, args.probe_samples, args.seed)
 
+    train_ds = MioCompactDataset(args.data_dir, train_idx, speakers)
+    probe_ds = MioCompactDataset(args.data_dir, probe_idx, speakers)
+
     if args.center_false:
-        from eval_mcs_trans_audio import SAMPLE_RATE
         train_ds = CenterFalseMelWrapper(train_ds, source_files)
         probe_ds = CenterFalseMelWrapper(probe_ds, source_files)
         print("center=False mel: computing on-the-fly from raw audio", flush=True)
 
+    if args.wavlm_frontend:
+        train_ds = WavLMFrontendDataset(train_ds, args.data_dir)
+        probe_ds = WavLMFrontendDataset(probe_ds, args.data_dir)
+        print("WavLM frontend: using cached wavlm_cnn (512d@46Hz) instead of mel",
+              flush=True)
+
     train_loader = DataLoader(
-        MioCompactDataset(args.data_dir, train_idx, speakers),
+        train_ds,
         batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers,
         collate_fn=ContentCollator(args.mel_frames, args.seed),
         generator=torch.Generator().manual_seed(args.seed),
     )
     probe_loader = DataLoader(
-        MioCompactDataset(args.data_dir, probe_idx, speakers),
+        probe_ds,
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers,
         collate_fn=ContentCollator(args.eval_mel_frames, args.seed + 999),
     )
 
     # ── config ──
+    ssl_layer_list = tuple(
+        int(v.strip()) for v in args.ssl_layers.split(",") if v.strip()
+    )
     config = MCSTransQ2D2Config(
         conv_dim=args.conv_dim,
         trans_dim=args.trans_dim,
@@ -752,6 +1139,17 @@ def main() -> None:
         grl_weight=args.grl_weight,
         grl_num_speakers=args.grl_num_speakers if args.grl_num_speakers > 0 else len(unique_speakers),
         stem_block_type=args.stem_block_type,
+        use_wavlm_frontend=args.wavlm_frontend,
+        delta2_weight=args.delta2_weight,
+        contrastive_weight=args.contrastive_weight,
+        contrastive_tau=args.contrastive_tau,
+        ssl_weight=args.ssl_weight,
+        ssl_layers=ssl_layer_list,
+        mamba_layers=args.mamba_layers,
+        mamba_d_state=args.mamba_d_state,
+        q2d2_gumbel_start=args.q2d2_gumbel_start,
+        q2d2_gumbel_end=args.q2d2_gumbel_end,
+        q2d2_l2_norm=args.q2d2_l2_norm,
     )
 
     # ── model ──
@@ -783,14 +1181,26 @@ def main() -> None:
                 q2d2_grid=args.q2d2_grid,
                 grl_weight=args.grl_weight,
                 grl_num_speakers=len(unique_speakers),
+                use_wavlm_frontend=args.wavlm_frontend,
+                delta2_weight=args.delta2_weight,
+                contrastive_weight=args.contrastive_weight,
+                contrastive_tau=args.contrastive_tau,
+                ssl_weight=args.ssl_weight,
+                ssl_layers=ssl_layer_list,
+                mamba_layers=args.mamba_layers,
+                mamba_d_state=args.mamba_d_state,
+                q2d2_gumbel_start=args.q2d2_gumbel_start,
+                q2d2_gumbel_end=args.q2d2_gumbel_end,
+                q2d2_l2_norm=args.q2d2_l2_norm,
             )
-        else:
             # Resume from Q2D2 checkpoint
             saved_cfg = checkpoint.get("config", {})
-            config = MCSTransQ2D2Config(**{
-                k: tuple(v) if isinstance(v, list) else v
-                for k, v in saved_cfg.items()
-            })
+            known = {f.name for f in __import__("dataclasses").fields(MCSTransQ2D2Config)}
+            cfg_filtered = {}
+            for k, v in saved_cfg.items():
+                if k in known:
+                    cfg_filtered[k] = tuple(v) if isinstance(v, list) else v
+            config = MCSTransQ2D2Config(**cfg_filtered)
 
     model = MCSTransQ2D2(config).to(device)
 
@@ -881,7 +1291,15 @@ def main() -> None:
     print(f"Objective: content_cos={args.content_cos_weight} "
           f"content_l1={args.content_l1_weight} "
           f"delta={args.delta_weight} "
+          f"delta2={args.delta2_weight} "
           f"decoder_wave={args.decoder_wave_weight}", flush=True)
+    print(f"Extra: contrastive={args.contrastive_weight} "
+          f"ssl={args.ssl_weight} "
+          f"mamba_layers={config.mamba_layers}/{config.n_layers} "
+          f"gumbel={args.q2d2_gumbel_start:.1f}→{args.q2d2_gumbel_end:.1f} "
+          f"wavlm_frontend={args.wavlm_frontend} "
+          f"stem={args.stem_block_type}"
+          f"l2_norm={config.q2d2_l2_norm}", flush=True)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -897,7 +1315,22 @@ def main() -> None:
     quantizer = model.q2d2.quantizer  # for utilization stats
     run_started = time.time()
 
+    def _gumbel_temp(epoch: int) -> float:
+        """Linear annealing from q2d2_gumbel_start → q2d2_gumbel_end."""
+        start = args.q2d2_gumbel_start
+        end = args.q2d2_gumbel_end
+        if start <= 0.0:
+            return 0.0
+        E = max(1, args.epochs - start_epoch)
+        frac = min(1.0, epoch / max(1, E - 1))
+        return start + (end - start) * frac
+
     for epoch in range(start_epoch, args.epochs):
+        # ── Gumbel temperature annealing ──
+        tau = _gumbel_temp(epoch)
+        if args.q2d2_gumbel_start > 0:
+            quantizer.gumbel_temperature = tau
+
         model.train()
         totals: dict[str, float] = {}
         step_started = time.time()
@@ -918,7 +1351,9 @@ def main() -> None:
             output = model(batch.mel, padding_mask=batch.mask)
             loss, metrics = q2d2_losses(output, batch, args, quantizer,
                                         model.speaker_classifier, speaker_ids,
-                                        time_shift=args.time_shift)
+                                        time_shift=args.time_shift,
+                                        ssl_heads=model.ssl_heads,
+                                        ssl_layers=config.ssl_layers)
 
             # Decoder-in-loop: MR-STFT vs original wav
             if (mio is not None and

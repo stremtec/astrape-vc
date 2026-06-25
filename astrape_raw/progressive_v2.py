@@ -11,16 +11,23 @@ from train_mcs_q2d2 import MCSTransQ2D2Config
 
 
 class ProgressiveRawFrontendV2(nn.Module):
-    """Stacked causal strided convs → ReLU → residual blocks → stride-2 → 50Hz.
+    """Stacked causal strided convs → ReLU → residual blocks + onset path → 50Hz.
 
-    PCM (B,1,T) → 3× CausalConv1d(stride=3) → 4×4×2 downsample
-                  → ResidualBlocks → stride-2 → 50Hz → proj_in → transformer.
+    PCM (B,1,T) → main path: 3×3×7×7 stride-441 → 100Hz
+               → onset path: k=5 stride-441 (preserves fine transients)
+               → gate-sum → stride-2 → 50Hz → proj_in → transformer.
+
+    The onset path is the key fix for the v1 plateau at cos=0.66: the deep
+    strided stack (7×7×7×... receptive field) smooths away onsets/transients
+    that a causal model needs for short-horizon prediction.  A parallel
+    wide-stride small-kernel conv preserves those edges.
     """
 
     def __init__(self, config: MCSTransQ2D2Config):
         super().__init__()
         dim = config.conv_dim  # 320
 
+        # ── MAIN PATH: progressive strided convs ──
         # Stage 1: 1→64, stride=3 (44100→14700Hz)
         self.s1 = nn.Sequential(
             CausalConv1d(1, 64, kernel_size=7, stride=3), nn.ReLU())
@@ -36,6 +43,14 @@ class ProgressiveRawFrontendV2(nn.Module):
         # Stage 5: dim→dim, stride=2 (100→50Hz)
         self.s5 = nn.Sequential(
             CausalConv1d(dim, dim, kernel_size=3, stride=2), nn.ReLU())
+
+        # ── ONSET PATH: wide-stride shallow conv for transient preservation ──
+        # k=5, stride=441 directly maps raw PCM to the 100Hz level,
+        # preserving ~50ms onsets/transients the deep main path smooths away.
+        self.onset_conv = CausalConv1d(1, dim, kernel_size=5, stride=441)
+        self.onset_gate = nn.Parameter(torch.full((1, dim, 1), -2.0))
+        # starts at sigmoid(-2) ≈ 0.12, letting the onset path ramp up
+        # gradually rather than injecting random noise from random init.
 
         # Residual blocks
         self.blocks = nn.ModuleList([
@@ -54,9 +69,6 @@ class ProgressiveRawFrontendV2(nn.Module):
             for _ in config.skip_dilations
         ])
 
-        # s5 already added above, remove old s5 and downsample
-        # No additional s5/downsample needed — s5 already does stride-2
-
         # Proj to transformer dim
         self.proj_in = (
             nn.Linear(dim, config.trans_dim, bias=False)
@@ -64,6 +76,7 @@ class ProgressiveRawFrontendV2(nn.Module):
         )
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        # ── Main path to 100Hz ──
         h = self.s1(waveform)
         h = self.s2(h)
         h = self.s3(h)
@@ -78,6 +91,13 @@ class ProgressiveRawFrontendV2(nn.Module):
                 s = F.interpolate(s, size=h.shape[2], mode='linear')
             h = h + torch.sigmoid(gate) * s
 
+        # ── Onset path (100Hz, same rate as main path pre-s5) ──
+        onset = F.silu(self.onset_conv(waveform))
+        if onset.shape[2] != h.shape[2]:
+            onset = F.interpolate(onset, size=h.shape[2], mode='linear')
+        h = h + torch.sigmoid(self.onset_gate) * onset
+
+        # ── Stride-2 → 50Hz → proj_in → transformer ──
         h = self.s5(h)
         h = h.transpose(1, 2)
         return self.proj_in(h)

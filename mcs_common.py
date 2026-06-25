@@ -446,6 +446,9 @@ def move_batch(batch: Batch, device: torch.device) -> Batch:
         speakers=batch.speakers,
         indices=batch.indices.to(device),
         crop_starts=batch.crop_starts.to(device),
+        ssl_L0=batch.ssl_L0.to(device),
+        ssl_L4=batch.ssl_L4.to(device),
+        ssl_L8=batch.ssl_L8.to(device),
     )
 
 

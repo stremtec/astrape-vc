@@ -29,7 +29,11 @@ import torchaudio
 warnings.filterwarnings("ignore")
 sys.path.insert(0, "external/MioCodec/src")
 
-from train_mcs_trans import MCSTrans, MCSTransConfig  # noqa: E402
+try:
+    from train_mcs_trans import MCSTrans, MCSTransConfig  # noqa: E402
+except ImportError:
+    MCSTrans = None  # type: ignore
+    MCSTransConfig = None  # type: ignore
 # Optional: calibrator support (may not be available)
 try:
     from mcs_calibrator import load_calibrator  # noqa: E402

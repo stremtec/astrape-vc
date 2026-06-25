@@ -53,45 +53,7 @@ DEFAULT_OUT_DIR = Path("astrape_raw/checkpoints")
 # Raw Waveform Frontend
 # ─────────────────────────────────────────────
 
-class RawWaveformFrontend(nn.Module):
-    """CausalConv1d on raw PCM, replacing mel frontend.
-
-    PCM (B, 1, T) → CausalConv1d(k=2048, stride=441) → (B, 320, T100)
-    → ResidualBlocks → skip → stride-2 downsample → (B, 320, T50)
-    → proj_in → (B, T50, trans_dim)
-    """
-
-    def __init__(self, config: MCSTransQ2D2Config):
-        super().__init__()
-        dim = config.conv_dim  # 320
-
-        self.raw_conv = CausalConv1d(1, dim, kernel_size=2048, stride=RAW_STRIDE)
-        self.blocks = nn.ModuleList([
-            ResidualConvBlock(dim, config.conv_kernel, d, config.dropout)
-            for d in config.stem_dilations
-        ])
-        self.skips = nn.ModuleList([
-            CausalConv1d(1, dim, kernel_size=2048, stride=RAW_STRIDE, dilation=d)
-            for d in config.skip_dilations
-        ])
-        self.skip_gates = nn.ParameterList([
-            nn.Parameter(torch.full((1, dim, 1), -2.0))
-            for _ in config.skip_dilations
-        ])
-        self.downsample = CellDownsample(dim)
-        self.proj_in = (
-            nn.Linear(dim, config.trans_dim, bias=False)
-            if dim != config.trans_dim else nn.Identity()
-        )
-
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        h = F.silu(self.raw_conv(waveform))
-        for block in self.blocks:
-            h = block(h)
-        for skip, gate in zip(self.skips, self.skip_gates):
-            h = h + torch.sigmoid(gate) * F.silu(skip(waveform))
-        h = self.downsample(h).transpose(1, 2)
-        return self.proj_in(h)
+from astrape_raw.progressive_v2 import ProgressiveRawFrontendV2 as RawWaveformFrontend
 
 
 # ─────────────────────────────────────────────
@@ -123,6 +85,10 @@ class MCSTransRaw(nn.Module):
             levels=list(config.q2d2_levels),
             vq_type=config.q2d2_grid,
         )
+        # ── forecast heads: predict teacher[t+1], teacher[t+2] ──
+        self.forecast_head_1 = nn.Linear(config.trans_dim, config.content_dim)
+        self.forecast_head_2 = nn.Linear(config.trans_dim, config.content_dim)
+
         self.speaker_classifier: SpeakerClassifier | None = None
         if config.grl_weight > 0 and config.grl_num_speakers > 0:
             self.speaker_classifier = SpeakerClassifier(
@@ -138,12 +104,18 @@ class MCSTransRaw(nn.Module):
         for layer in self.trans_layers:
             h = layer(h, attn_mask, kpm)
         h = self.norm(h)
+
+        # Forecast predictions (tapped pre-smooth, pre-Q2D2)
+        fc1 = self.forecast_head_1(h)
+        fc2 = self.forecast_head_2(h)
+
         h = h + self.smooth(h.transpose(1, 2)).transpose(1, 2)
         content, q2d2_codes = self.q2d2(h, return_codes=True)
         return {
             "projected": content.transpose(1, 2),
             "q2d2_codes": q2d2_codes,
-            "ordinal": None,
+            "forecast_1": fc1.transpose(1, 2),
+            "forecast_2": fc2.transpose(1, 2),
         }
 
 
@@ -245,14 +217,20 @@ def q2d2_losses(
     quantizer: Q2D2Quantizer | None = None,
     speaker_classifier: nn.Module | None = None,
     speaker_ids: torch.Tensor | None = None,
+    time_shift: int = 0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     projected = output["projected"]
     q2d2_codes = output.get("q2d2_codes")
 
-    length = min(projected.shape[2], batch.content.shape[1], batch.mask.shape[1])
-    mask = batch.mask[:, :length]
+    ts = time_shift
+    length = min(projected.shape[2] - ts, batch.content.shape[1] - ts,
+                 batch.mask.shape[1] - ts)
+    if length < 2:
+        return projected.sum() * 0.0, {"cos768": 0.0}
+    mask = batch.mask[:, ts:ts + length]
 
-    pred_768 = projected[:, :, :length]
+    # Time-shifted alignment: student[t] compares with teacher[t-ts]
+    pred_768 = projected[:, :, ts:ts + length]
     tgt_768 = batch.content[:, :length]
 
     voiced_boost = getattr(args, "voiced_boost", 1.0)
@@ -294,6 +272,30 @@ def q2d2_losses(
             args.content_l1_weight * content_l1 +
             args.delta_weight * delta)
 
+    # ── forecast loss (predict teacher[t+1], [t+2]) ──
+    forecast_weight = getattr(args, "forecast_weight", 0.0)
+    forecast_loss_val: float = 0.0
+    if forecast_weight > 0:
+        fc1 = output.get("forecast_1")
+        fc2 = output.get("forecast_2")
+        if fc1 is not None and fc2 is not None and length >= 3:
+            fc1_flat = fc1[:, :, :length].permute(0, 2, 1)   # (B, L, 768)
+            fc2_flat = fc2[:, :, :length].permute(0, 2, 1)
+            fc_L = min(length, batch.content.shape[1] - 2)
+            tgt_fc1 = batch.content[:, 1:1 + fc_L]
+            tgt_fc2 = batch.content[:, 2:2 + fc_L]
+            fc_mask = mask[:, :fc_L]
+            fc_vw = vw[:, :fc_L]
+            def _masked_mse(p, t, m, w):
+                se = (p - t).pow(2).mean(dim=-1)
+                denom = (w * m.float()).sum().clamp(min=1)
+                return (se * w * m.float()).sum() / denom
+            fl1 = _masked_mse(fc1_flat[:, :fc_L, :], tgt_fc1, fc_mask, fc_vw)
+            fl2 = _masked_mse(fc2_flat[:, :fc_L, :], tgt_fc2, fc_mask, fc_vw)
+            fl = (fl1 + fl2) * 0.5
+            forecast_loss_val = float(fl.detach().cpu())
+            loss = loss + forecast_weight * fl
+
     grl_loss_val: float = 0.0
     grl_acc_val: float = 0.0
     if speaker_classifier is not None and speaker_ids is not None:
@@ -313,6 +315,7 @@ def q2d2_losses(
         "delta": float(delta.detach().cpu()),
         "grl_loss": grl_loss_val,
         "grl_acc": grl_acc_val,
+        "forecast_loss": forecast_loss_val,
     }
 
     if quantizer is not None and q2d2_codes is not None:
@@ -326,7 +329,7 @@ def q2d2_losses(
 
 
 @torch.inference_mode()
-def evaluate(model, loader, device, args, quantizer=None, speaker_to_id=None):
+def evaluate(model, loader, device, args, quantizer=None, speaker_to_id=None, time_shift=0):
     model.eval()
     buckets: dict[str, list[float]] = {}
     for batch in loader:
@@ -339,7 +342,8 @@ def evaluate(model, loader, device, args, quantizer=None, speaker_to_id=None):
             )
         output = model(batch.mel, padding_mask=batch.mask)
         _, metrics = q2d2_losses(output, batch, args, quantizer,
-                                 model.speaker_classifier, speaker_ids)
+                                 model.speaker_classifier, speaker_ids,
+                                 time_shift=time_shift)
         for key, value in metrics.items():
             buckets.setdefault(key, []).append(value)
     model.train()
@@ -383,6 +387,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--content-cos-weight", type=float, default=1.0)
     p.add_argument("--content-l1-weight", type=float, default=0.5)
     p.add_argument("--delta-weight", type=float, default=0.04)
+    p.add_argument("--forecast-weight", type=float, default=0.0,
+                   help="Weight on forecast heads (predict teacher[t+1],[t+2]).")
+    p.add_argument("--time-shift", type=int, default=0,
+                   help="Shift teacher target backward by Δ frames (1 frame=40ms).")
     p.add_argument("--grl-weight", type=float, default=0.0)
     p.add_argument("--voiced-boost", type=float, default=1.0)
     return p.parse_args()
@@ -430,19 +438,42 @@ def main() -> None:
 
     # Model
     model = MCSTransRaw(config).to(device)
+    start_epoch, best_cos = 0, -1.0
+
+    if args.resume_from is not None:
+        checkpoint = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"], strict=False)
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        current_cos = float(checkpoint.get("metrics", {}).get("probe", {}).get("cos768", -1.0))
+        best_cos = max(float(checkpoint.get("best_probe_cos768", -1.0)), current_cos)
+        print(f"Resumed from {args.resume_from} at epoch={start_epoch} "
+              f"best_cos768={best_cos:.4f}", flush=True)
+
     params = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {params:,} params ({trainable:,} trainable), device={device}", flush=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+
+    if args.resume_from is not None:
+        checkpoint = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        if "optimizer" in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            except ValueError as e:
+                print(f"Optimizer state mismatch, starting fresh: {e}")
+        if "scheduler" in checkpoint:
+            try:
+                scheduler.load_state_dict(checkpoint["scheduler"])
+            except Exception:
+                pass
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     quantizer = model.q2d2.quantizer
-    best_cos = -1.0
     run_started = time.time()
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         totals: dict[str, float] = {}
         step_started = time.time()
@@ -461,7 +492,8 @@ def main() -> None:
 
             output = model(batch.mel, padding_mask=batch.mask)
             loss, metrics = q2d2_losses(output, batch, args, quantizer,
-                                        model.speaker_classifier, speaker_ids)
+                                        model.speaker_classifier, speaker_ids,
+                                        time_shift=args.time_shift)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -478,13 +510,15 @@ def main() -> None:
                     f"E{epoch:03d} step={step:04d}/{args.steps_per_epoch} "
                     f"loss={totals['loss']/denom:.4f} cos768={totals['cos768']/denom:.4f} "
                     f"l1={totals.get('content_l1',0)/denom:.4f} "
+                    f"fc={totals.get('forecast_loss',0)/denom:.4f} "
                     f"usage={totals.get('q2d2_usage',0)/denom:.3f} "
                     f"{elapsed/max(step,1):.3f}s/step",
                     flush=True,
                 )
 
         scheduler.step()
-        probe = evaluate(model, probe_loader, device, args, quantizer, speaker_to_id)
+        probe = evaluate(model, probe_loader, device, args, quantizer, speaker_to_id,
+                         time_shift=args.time_shift)
         metrics_full = {
             "epoch": epoch, "global_step": (epoch + 1) * args.steps_per_epoch,
             "probe": probe, "elapsed_seconds": time.time() - run_started,
