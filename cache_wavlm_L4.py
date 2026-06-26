@@ -54,11 +54,10 @@ def main():
                         x = layer.layer_norm(x)
                 x = torch.nn.functional.gelu(x)
 
-        # L4 output: stride = 5*2^4 = 80. To get 50Hz: pool kernel=80/50*rate...
-        # Actually: L4 stride=80, WavLM L6 stride=320. We need 4× pooling to match.
-        # avg_pool1d with kernel=4, stride=4 → reduces 80-stride to 320-stride → 50Hz
-        cnn = x.squeeze(0).transpose(0, 1)  # (512, T_L4)
-        cnn = torch.nn.functional.avg_pool1d(cnn, kernel_size=4, stride=4)
+        # L4 output: stride = 5*2^4 = 80. To get 50Hz: pool 4× (80→320 stride)
+        # x shape: (1, 512, T_L4) from conv layers
+        cnn = x.squeeze(0)  # (512, T_L4)
+        cnn = torch.nn.functional.avg_pool1d(cnn.unsqueeze(0), kernel_size=4, stride=4).squeeze(0)  # (512, T_50Hz)
         cnn = cnn.transpose(0, 1)  # (T_50Hz, 512)
 
         cnn_np = cnn.cpu().numpy().astype(np.float32)
