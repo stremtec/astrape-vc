@@ -279,17 +279,31 @@ def main():
     if args.use_mamba:
         print(f"Mamba config: d_state={dec_cfg.mamba_d_state}, expand={dec_cfg.mamba_expand}")
     decoder = CausalDecoder(dec_cfg).to(device)
-    if args.resume:
-        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
-        decoder.load_state_dict(ck["state_dict"], strict=False)
-        print(f"Resumed decoder from {args.resume}")
-
-    dec_params = sum(p.numel() for p in decoder.parameters())
-    print(f"Decoder: {dec_params:,} params ({dec_params/1e6:.1f}M)")
 
     # ── Optimizer ──
     opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+
+    # ── Resume (with optimizer/scheduler state) ──
+    start_epoch = 0
+    if args.resume:
+        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+        decoder.load_state_dict(ck["state_dict"], strict=False)
+        if "optimizer" in ck:
+            opt.load_state_dict(ck["optimizer"])
+            print("Resumed optimizer state")
+        if "scheduler" in ck:
+            sch.load_state_dict(ck["scheduler"])
+            print("Resumed scheduler state")
+        if "epoch" in ck:
+            start_epoch = ck["epoch"] + 1
+        global_step = ck.get("global_step", 0)
+        print(f"Resumed from epoch {start_epoch} (global_step={global_step})")
+    else:
+        global_step = 0
+
+    dec_params = sum(p.numel() for p in decoder.parameters())
+    print(f"Decoder: {dec_params:,} params ({dec_params/1e6:.1f}M)")
 
     # ── Mel loss function ──
     mel_fn = torchaudio.transforms.MelSpectrogram(
@@ -313,9 +327,8 @@ def main():
 
     t0 = time.time()
     best_loss = float("inf")
-    global_step = 0
 
-    for ep in range(args.epochs):
+    for ep in range(start_epoch, args.epochs):
         decoder.train()
         epoch_mrstft = 0.0
         epoch_mel = 0.0
@@ -468,6 +481,8 @@ def main():
         # ── Checkpoint ──
         ckpt = {
             "state_dict": decoder.state_dict(),
+            "optimizer": opt.state_dict(),
+            "scheduler": sch.state_dict(),
             "decoder_config": dec_cfg.__dict__,
             "enc_config": enc_cfg.__dict__ if hasattr(enc_cfg, '__dict__') else {},
             "epoch": ep,
