@@ -904,7 +904,7 @@ class WavLMFrontendDataset(Dataset):
         sample = self.base[idx]
         si = int(sample['idx'])
         # Load cached WavLM CNN from .npy file
-        cnn_path = self.data_dir / self.wavlm_dir / f's_{si:05d}.npy'
+        cnn_path = Path(self.wavlm_dir) / f's_{si:05d}.npy' if Path(self.wavlm_dir).is_absolute() else self.data_dir / self.wavlm_dir / f's_{si:05d}.npy'
         if not cnn_path.exists():
             raise RuntimeError(
                 f"WavLM frontend: sample s_{si:05d} has no wavlm_cnn cache. "

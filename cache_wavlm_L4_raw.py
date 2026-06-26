@@ -16,12 +16,15 @@ from eval_mcs_trans_audio import load_mio, load_wave, SAMPLE_RATE
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data-dir', default='data/mio_vctk_full_compact')
+    ap.add_argument('--out-dir', default=None,
+                    help='Output directory (default: data-dir/wavlm_L4_200hz)')
     ap.add_argument('--max-s', type=float, default=6.0)
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--limit', type=int, default=0)
     args = ap.parse_args()
 
-    meta = np.load(Path(args.data_dir) / 'meta.npz', allow_pickle=False)
+    data_dir = Path(args.data_dir)
+    meta = np.load(data_dir / 'meta.npz', allow_pickle=False)
     n = int(meta['n_samples'])
     srcs = meta['source_files'][:n].astype(str)
     end = n if args.limit == 0 else min(n, args.start + args.limit)
@@ -29,8 +32,8 @@ def main():
 
     mio = load_mio('cpu').eval()
     fe = mio.ssl_feature_extractor.model.feature_extractor
-    out_dir = Path(args.data_dir) / 'wavlm_L4_200hz'
-    out_dir.mkdir(exist_ok=True)
+    out_dir = Path(args.out_dir) if args.out_dir else data_dir / 'wavlm_L4_200hz'
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(args.start, end):
         out_path = out_dir / f's_{i:05d}.npy'
