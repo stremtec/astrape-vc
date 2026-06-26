@@ -875,9 +875,10 @@ class WavLMFrontendDataset(Dataset):
     output frames to keep, just like for mel.
     """
 
-    def __init__(self, base: Dataset, data_dir: Path):
+    def __init__(self, base: Dataset, data_dir: Path, wavlm_dir: str = "wavlm_16k"):
         self.base = base
         self.data_dir = data_dir
+        self.wavlm_dir = wavlm_dir
 
     def __len__(self) -> int:
         return len(self.base)
@@ -886,7 +887,7 @@ class WavLMFrontendDataset(Dataset):
         sample = self.base[idx]
         si = int(sample['idx'])
         # Load cached WavLM CNN from .npy file
-        cnn_path = self.data_dir / 'wavlm_16k' / f's_{si:05d}.npy'
+        cnn_path = self.data_dir / self.wavlm_dir / f's_{si:05d}.npy'
         if not cnn_path.exists():
             raise RuntimeError(
                 f"WavLM frontend: sample s_{si:05d} has no wavlm_cnn cache. "
@@ -1057,6 +1058,8 @@ def parse_args() -> argparse.Namespace:
                    help="Final Gumbel temperature for Q2D2 relaxation (anneal).")
     p.add_argument("--wavlm-frontend", action="store_true",
                    help="Use cached WavLM CNN features instead of mel.")
+    p.add_argument("--wavlm-dir", default="wavlm_16k",
+                   help="Subdirectory for WavLM cache (default: wavlm_16k, use wavlm_L4 for L4)")
 
     return p.parse_args()
 
@@ -1101,9 +1104,9 @@ def main() -> None:
         print("center=False mel: computing on-the-fly from raw audio", flush=True)
 
     if args.wavlm_frontend:
-        train_ds = WavLMFrontendDataset(train_ds, args.data_dir)
-        probe_ds = WavLMFrontendDataset(probe_ds, args.data_dir)
-        print("WavLM frontend: using cached wavlm_cnn (512d@46Hz) instead of mel",
+        train_ds = WavLMFrontendDataset(train_ds, args.data_dir, args.wavlm_dir)
+        probe_ds = WavLMFrontendDataset(probe_ds, args.data_dir, args.wavlm_dir)
+        print(f"WavLM frontend: using cached {args.wavlm_dir} (512d) instead of mel",
               flush=True)
 
     train_loader = DataLoader(
