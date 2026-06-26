@@ -220,6 +220,8 @@ def main():
     ap.add_argument("--mrstft-weight", type=float, default=1.0)
     ap.add_argument("--mel-l1-weight", type=float, default=0.3,
                     help="Auxiliary Mel L1 loss weight")
+    ap.add_argument("--complex-weight", type=float, default=0.0,
+                    help="Complex STFT loss weight (L1 on real+imag, prevents phase collapse)")
     ap.add_argument("--use-mamba", action="store_true",
                     help="Use Mamba SSM blocks instead of ShallowConv in Phase 3")
 
@@ -390,7 +392,24 @@ def main():
             else:
                 mel_l1 = torch.tensor(0.0, device=device)
 
-            loss = args.mrstft_weight * mrstft + args.mel_l1_weight * mel_l1
+            # ── Complex STFT loss (L1 on real+imag, prevents phase collapse) ──
+            if args.complex_weight > 0:
+                cmplx = torch.tensor(0.0, device=device)
+                for b in range(pred_cpu.shape[0]):
+                    pred_spec = torch.stft(pred_cpu[b], n_fft=1008, hop_length=252,
+                                           win_length=1008, window=torch.hann_window(1008),
+                                           return_complex=True)
+                    tgt_spec = torch.stft(tgt_cpu[b], n_fft=1008, hop_length=252,
+                                          win_length=1008, window=torch.hann_window(1008),
+                                          return_complex=True)
+                    cmplx = cmplx + F.l1_loss(pred_spec.real, tgt_spec.real) \
+                                  + F.l1_loss(pred_spec.imag, tgt_spec.imag)
+                complex_loss = cmplx / pred_cpu.shape[0]
+            else:
+                complex_loss = torch.tensor(0.0, device=device)
+
+            loss = args.mrstft_weight * mrstft + args.mel_l1_weight * mel_l1 \
+                   + args.complex_weight * complex_loss
 
             # ── Backward ──
             opt.zero_grad(set_to_none=True)

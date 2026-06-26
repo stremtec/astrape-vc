@@ -66,8 +66,8 @@ class CausalDecoderConfig:
 
     # Phase 4: ISTFT head
     istft_bridge_dim: int = 512
-    n_fft: int = 1024
-    hop_length: int = 256
+    n_fft: int = 1008           # divisible by 4 for COLA with Hann
+    hop_length: int = 252       # 44100/252 = 175.0 Hz (exact match with 7× upsample)
     istft_padding: str = "same"
 
     dropout: float = 0.0

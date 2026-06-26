@@ -68,12 +68,12 @@ Mic input 44.1kHz
 | Component | Algorithmic | Compute (CPU) |
 |-----------|-------------|---------------|
 | Resampler 44.1k→16k | ~2ms | ~0.1ms |
-| WavLM CNN RF | 25ms | 0.4ms |
+| WavLM CNN RF (L0-L6 causal) | **40ms** (639 samples @16kHz) | 0.4ms |
 | Adapter | 0ms | 0.01ms |
 | Stem + Downsample | 0ms | 0.3ms |
 | Transformer 7L | 0ms | 0.5ms |
 | Q2D2 | 0ms | 0.01ms |
-| **Encoder Total** | **~27ms** | **~1.3ms** |
+| **Encoder Total** | **~42ms** | **~1.3ms** |
 
 ## State Carry (per component)
 
@@ -126,10 +126,10 @@ Q2D2 content (B, T, 768) @ 25Hz      Speaker (B, 128)
   │     delay: 4 frames @ 172Hz = 23.2ms
   │   → (B, T_stft, 384) @ 172Hz
   │
-  ▼ Phase 4: ISTFT Head (8.7ms)
+  ▼ Phase 4: ISTFT Head (8.5ms)
   │   Pointwise 384→512
-  │   ISTFTHead(Linear→mag/phase→iSTFT, n_fft=1024, hop=256)
-  │     delay: pad=384 samples @ 44.1kHz = 8.7ms
+  │   ISTFTHead(Linear→mag/phase→iSTFT, n_fft=1008, hop=252)
+  │     delay: pad=378 samples @ 44.1kHz = 8.5ms
   │   → (B, T_audio) @ 44.1kHz
   │
   ▼ MR-STFT loss vs original audio (Gaussian blurred, σ=2ms)
@@ -172,10 +172,10 @@ Q2D2 content (1 frame @ 25Hz)        Speaker (1, 128)
 | Phase 1 (Pointwise+2L Trans) | 0ms | ~0.2ms |
 | Phase 2 (repeat+pointwise) | 0ms | ~0.01ms |
 | Phase 3 (2× Conv k=3) | 23.2ms | ~0.05ms |
-| Phase 4 (pointwise+iSTFT) | 8.7ms | ~0.2ms |
-| **Decoder Total** | **31.9ms** | **~0.5ms** |
-| + Encoder | 27ms | ~1.3ms |
-| **E2E Total** | **58.9ms** | **~1.8ms** |
+| Phase 4 (pointwise+iSTFT) | 8.5ms | ~0.2ms |
+| **Decoder Total** | **31.7ms** | **~0.5ms** |
+| + Encoder | 42ms | ~1.3ms |
+| **E2E Total** | **73.7ms** | **~1.8ms** |
 
 ### Decoder State Carry (per component)
 

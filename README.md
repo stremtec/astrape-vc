@@ -11,10 +11,10 @@ Mic 44.1kHz → resample(44.1k→16k) → WavLM CNN (94M, frozen, pad=0) → 50H
   → Downsample(2×) → 25Hz → ProjIn(320→512)
   → Causal Transformer 7L (13.8M, RoPE+SwiGLU, window=256)
   → Q2D2 (3M codes, Rhombic[9×9]³) → content 768d @ 25Hz
-  → MioCodec Decoder (228M, frozen) → wav 44.1kHz
+  → Decoder v4 (7.08M, causal streaming) → wav 44.1kHz
 ```
 
-**Learnable: 22.3M | Frozen: 94.4M | Total algorithmic latency: ~27ms**
+**Learnable: 22.3M | Frozen: 94.4M | Total algorithmic latency: ~42ms (encoder) + ~32ms (decoder) = ~74ms**
 
 ## Key Features
 
@@ -124,11 +124,11 @@ STFT-domain teacher forcing with Gaussian-blurred targets (cdecoder.md).
 
 | Component | Params | Delay |
 |-----------|--------|-------|
-| Encoder (7L WavLM) | 22.4M | 27ms |
-| Decoder (Conv) | 7.08M | 31.9ms |
-| Decoder (Mamba) | 8.70M | 20.3ms |
-| **E2E (Conv)** | **29.4M** | **58.9ms** |
-| **E2E (Mamba)** | **31.1M** | **47.3ms** |
+| Encoder (7L WavLM) | 22.4M | 42ms |
+| Decoder (Conv) | 7.08M | 31.7ms |
+| Decoder (Mamba) | 8.70M | 20.1ms |
+| **E2E (Conv)** | **29.4M** | **73.7ms** |
+| **E2E (Mamba)** | **31.1M** | **62.1ms** |
 
 ## References
 
