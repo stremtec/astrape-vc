@@ -7,13 +7,13 @@ VCTK wav 44.1kHz
   │
   ▼ resample(44.1k→16k)  ← MioCodec ssl.resampler와 동일
   │
-  ▼ WavLM CNN (94M, frozen, stride=320)
-  │   16,000 / 320 = 50.0 Hz (정확)
+  ▼ WavLM CNN L0-L4 (94M frozen, layers 0-4 only, stride=80→pool4×→50Hz)
+  │   delay: 160 samples @16kHz = 10ms (CNN) + 15ms (pool) = 25ms
   │   → (T, 512) float32 @ 50Hz
   │
-  │  [cached to wavlm_16k/s_XXXXX.npy, 14GB]
+  │  [cached to wavlm_L4/s_XXXXX.npy]
   │
-  ▼ WavLMFrontendAdapter (764K, learned)
+  ▼ WavLMFrontendAdapter (87K, learned)
   │   Linear(512→256)→GELU→Linear(256→80)
   │   → (T, 80) @ 50Hz
   │
@@ -24,7 +24,7 @@ VCTK wav 44.1kHz
   ▼ CellDownsample(2×)
   │   → (T/2, 320) @ 25Hz
   │
-  ▼ ProjIn(320→512) → Transformer 7L (13.8M)
+  ▼ ProjIn(320→512) → Transformer 8L (15.8M)
   │   RoPE + SwiGLU, window=256
   │   → (T/2, 512) @ 25Hz
   │
@@ -43,11 +43,11 @@ Mic input 44.1kHz
   ▼ Polyphase resampler (44.1k→16k)
   │   delay: ~2ms
   │
-  ▼ WavLM CNN — state-carry per conv layer
-  │   7 causal convs, padding=0
-  │   output: 1 frame @ 50Hz per 320 samples
-  │   algorithmic delay: 400 samples @ 16kHz = 25ms
-  │   compute: ~0.4ms/frame (CPU)
+  ▼ WavLM CNN L0-L4 — state-carry per conv layer
+  │   5 causal convs, padding=0
+  │   output: 1 frame @ 50Hz per 160 samples (after 4× pool)
+  │   algorithmic delay: 160 samples @ 16kHz = 10ms (CNN) + 15ms (pool) = 25ms
+  │   compute: ~0.3ms/frame (CPU)
   │
   ▼ Adapter — per-frame, 0ms delay
   │
@@ -68,12 +68,12 @@ Mic input 44.1kHz
 | Component | Algorithmic | Compute (CPU) |
 |-----------|-------------|---------------|
 | Resampler 44.1k→16k | ~2ms | ~0.1ms |
-| WavLM CNN RF (L0-L6 causal) | **40ms** (639 samples @16kHz) | 0.4ms |
+| WavLM CNN L0-L4 (5 convs + pool) | **25ms** (160+pool) | 0.3ms |
 | Adapter | 0ms | 0.01ms |
 | Stem + Downsample | 0ms | 0.3ms |
-| Transformer 7L | 0ms | 0.5ms |
+| Transformer 8L | 0ms | 0.6ms |
 | Q2D2 | 0ms | 0.01ms |
-| **Encoder Total** | **~42ms** | **~1.3ms** |
+| **Encoder Total** | **~27ms** | **~1.3ms** |
 
 ## State Carry (per component)
 
@@ -174,8 +174,8 @@ Q2D2 content (1 frame @ 25Hz)        Speaker (1, 128)
 | Phase 3 (2× Conv k=3) | 23.2ms | ~0.05ms |
 | Phase 4 (pointwise+iSTFT) | 8.5ms | ~0.2ms |
 | **Decoder Total** | **31.7ms** | **~0.5ms** |
-| + Encoder | 42ms | ~1.3ms |
-| **E2E Total** | **73.7ms** | **~1.8ms** |
+| + Encoder | 27ms | ~1.3ms |
+| **E2E Total** | **58.7ms** | **~1.8ms** |
 
 ### Decoder State Carry (per component)
 
