@@ -1,7 +1,7 @@
 """Build a high-quality .astrape voicebank from target-speaker audio.
 
 The inline extraction in the eval scripts is a SINGLE `mio.encode` forward over
-the first ≤5 s of ONE clip (`eval_q2d2_vc.py`, `eval_mcs_trans_audio.py`). The
+the first ≤5 s of ONE clip (`evaluate.py`). The
 speaker embedding (MioCodec global branch: WavLM L1–L2 → ConvNeXt → attentive
 stats pool) is more representative/stable when fed:
 
@@ -13,7 +13,7 @@ All embeddings live in MioCodec's global space (same as the decoder's training
 condition), so the chunk-mean is a cleaner centroid, not a distribution shift.
 
 Usage:
-  .venv/bin/python build_voicebank.py ref1.wav [ref2.wav ...] -o p225.astrape
+  .venv/bin/python -m astrape.build_voicebank ref1.wav [ref2.wav ...] -o p225.astrape
 """
 
 import argparse
@@ -25,8 +25,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from astrape.miocodec import load_mio, load_wave, SAMPLE_RATE, extract_chunk_embeddings
-from astrape.voicebank import VoiceBank, analyze_reference, MIN_REFERENCE_SECONDS
+from .miocodec import load_mio, load_wave, SAMPLE_RATE, extract_chunk_embeddings
+from .voicebank import VoiceBank, analyze_reference, MIN_REFERENCE_SECONDS
 
 
 def main():

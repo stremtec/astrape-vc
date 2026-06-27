@@ -17,6 +17,9 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset
 
+import math
+from dataclasses import dataclass, field
+
 S = 44100  # decoder / audio sample rate
 
 
@@ -58,7 +61,7 @@ class Phase0Dataset(Dataset):
         self.rng = random.Random(seed)
 
         # Preferred: per-speaker centroid map {speaker_id: (128,) tensor}
-        # (from cache_speaker_embeddings.py — covers ALL speakers).
+        # (from `astrape.cache --what speakers` — covers ALL speakers).
         self.speaker_emb_map = speaker_emb_map
         if speaker_emb_map is not None:
             self._spk_fallback = torch.stack(list(speaker_emb_map.values())).mean(0)
@@ -137,3 +140,189 @@ def collate_phase0(batch):
     speaker = torch.stack([b["speaker"] for b in batch])  # (B, 128)
     indices = [b["idx"] for b in batch]
     return wavlm, audio, speaker, indices
+
+
+# ════════════════════════════════════════════════════════════════════
+# Encoder-side dataset (compact VCTK cache → Batch), moved from mcs_common.py
+# ════════════════════════════════════════════════════════════════════
+
+DEFAULT_DATA_DIR = Path("data/mio_vctk_full_compact")
+DEFAULT_PROJECTION = Path("checkpoints/teacher_fsq_proj_out.pt")
+
+
+@dataclass
+class Batch:
+    mel: torch.Tensor            # (B, 80, M)
+    content: torch.Tensor        # (B, L, 768)  teacher target
+    tokens: torch.Tensor         # (B, L)        integer codes
+    mask: torch.Tensor           # (B, L)        bool
+    speakers: list[str]
+    indices: torch.Tensor
+    crop_starts: torch.Tensor
+    ssl_L0: torch.Tensor = field(default_factory=lambda: torch.empty(0))  # (B, Lx2, 768)
+    ssl_L4: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    ssl_L8: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+
+
+class MioCompactDataset(Dataset):
+    def __init__(self, root: Path, indices: np.ndarray, speakers: np.ndarray):
+        self.root = root
+        self.indices = [int(i) for i in indices.tolist()]
+        self.speakers = speakers
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, item: int) -> dict:
+        idx = self.indices[item]
+        with np.load(self.root / f"s_{idx:05d}.npz", allow_pickle=False) as data:
+            ssl0 = data.get("ssl_L0")
+            ssl4 = data.get("ssl_L4")
+            ssl8 = data.get("ssl_L8")
+            return {
+                "idx": idx,
+                "speaker": str(self.speakers[idx]),
+                "mel": torch.from_numpy(data["logmel"].astype(np.float32)),
+                "content": torch.from_numpy(data["ce_768"].astype(np.float32)),
+                "tokens": torch.from_numpy(data["ct"].astype(np.int64)),
+                "ssl_L0": torch.from_numpy(ssl0.astype(np.float32)) if ssl0 is not None else torch.empty(0,768),
+                "ssl_L4": torch.from_numpy(ssl4.astype(np.float32)) if ssl4 is not None else torch.empty(0,768),
+                "ssl_L8": torch.from_numpy(ssl8.astype(np.float32)) if ssl8 is not None else torch.empty(0,768),
+            }
+
+
+class ContentCollator:
+    def __init__(self, mel_frames: int | None, seed: int, pad_mel_multiple: int = 2,
+                 frames_per_token: int = 2):
+        self.mel_frames = mel_frames
+        self.rng = random.Random(seed)
+        self.pad_mel_multiple = pad_mel_multiple
+        # Frontend ("mel") frames per teacher token (25Hz content).  Mel and the
+        # 50Hz WavLM cache are 2:1; the 200Hz L4 raw cache is 8:1.  Crops must use
+        # this ratio to keep the cropped frontend window aligned with the cropped
+        # content/token window (a hard-coded 2 overruns and mis-pairs at 200Hz).
+        self.frames_per_token = frames_per_token
+
+    def _crop(self, sample: dict) -> tuple:
+        mel = sample["mel"]
+        content = sample["content"]
+        tokens = sample["tokens"]
+        ssl0 = sample.get("ssl_L0", torch.empty(0,768))
+        ssl4 = sample.get("ssl_L4", torch.empty(0,768))
+        ssl8 = sample.get("ssl_L8", torch.empty(0,768))
+        idx = int(sample["idx"])
+        if self.mel_frames is None or mel.shape[1] <= self.mel_frames:
+            return mel, content, tokens, ssl0, ssl4, ssl8, 0, idx
+
+        R = self.frames_per_token
+        max_start = mel.shape[1] - self.mel_frames
+        start = self.rng.randint(0, max_start)
+        start -= start % R                       # align crop to a token boundary
+        mel = mel[:, start : start + self.mel_frames]
+        token_start = start // R
+        token_len = math.ceil(mel.shape[1] / R)
+        ssl_start = token_start * 2              # SSL features are 50Hz = 2× token rate
+        ssl_len = token_len * 2
+        return (
+            mel,
+            content[token_start : token_start + token_len],
+            tokens[token_start : token_start + token_len],
+            ssl0[ssl_start : ssl_start + ssl_len] if ssl0.numel()>0 else ssl0,
+            ssl4[ssl_start : ssl_start + ssl_len] if ssl4.numel()>0 else ssl4,
+            ssl8[ssl_start : ssl_start + ssl_len] if ssl8.numel()>0 else ssl8,
+            start,
+            idx,
+        )
+
+    def __call__(self, samples: list[dict]) -> Batch:
+        cropped = [self._crop(sample) for sample in samples]
+        max_mel = max(mel.shape[1] for mel, _, _, _, _, _, _, _ in cropped)
+        if self.pad_mel_multiple > 1:
+            max_mel = ((max_mel + self.pad_mel_multiple - 1) // self.pad_mel_multiple) * self.pad_mel_multiple
+        max_tokens = max(tokens.shape[0] for _, _, tokens, _, _, _, _, _ in cropped)
+        max_ssl = max_tokens * 2
+
+        mels, contents, tokens_out, masks = [], [], [], []
+        ssl0s, ssl4s, ssl8s = [], [], []
+        crop_starts, indices = [], []
+        for mel, content, tokens, ssl0, ssl4, ssl8, crop_start, idx in cropped:
+            token_len = min(tokens.shape[0], content.shape[0])
+            mels.append(F.pad(mel, (0, max_mel - mel.shape[1])))
+            contents.append(F.pad(content[:token_len], (0, 0, 0, max_tokens - token_len)))
+            tokens_out.append(F.pad(tokens[:token_len], (0, max_tokens - token_len)))
+            mask = torch.zeros(max_tokens, dtype=torch.bool)
+            mask[:token_len] = True
+            masks.append(mask)
+            # SSL features: pad to max_ssl
+            if ssl0.numel() > 0:
+                sl = min(ssl0.shape[0], max_ssl)
+                ssl0s.append(F.pad(ssl0[:sl], (0,0,0,max_ssl-sl)))
+                ssl4s.append(F.pad(ssl4[:sl], (0,0,0,max_ssl-sl)))
+                ssl8s.append(F.pad(ssl8[:sl], (0,0,0,max_ssl-sl)))
+            else:
+                ssl0s.append(torch.zeros(max_ssl, 768))
+                ssl4s.append(torch.zeros(max_ssl, 768))
+                ssl8s.append(torch.zeros(max_ssl, 768))
+            crop_starts.append(crop_start)
+            indices.append(idx)
+
+        return Batch(
+            mel=torch.stack(mels),
+            content=torch.stack(contents),
+            tokens=torch.stack(tokens_out),
+            mask=torch.stack(masks),
+            ssl_L0=torch.stack(ssl0s),
+            ssl_L4=torch.stack(ssl4s),
+            ssl_L8=torch.stack(ssl8s),
+            speakers=[sample["speaker"] for sample in samples],
+            indices=torch.tensor(indices, dtype=torch.long),
+            crop_starts=torch.tensor(crop_starts, dtype=torch.long),
+        )
+
+
+def split_by_speaker(speakers: np.ndarray, val_fraction: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    unique = np.array(sorted(set(speakers.astype(str).tolist())), dtype=object)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique)
+    n_val = max(1, int(round(len(unique) * val_fraction)))
+    val_speakers = set(str(s) for s in unique[:n_val].tolist())
+    train_idx, val_idx = [], []
+    for idx, speaker in enumerate(speakers.astype(str).tolist()):
+        (val_idx if speaker in val_speakers else train_idx).append(idx)
+    return np.asarray(train_idx, dtype=np.int64), np.asarray(val_idx, dtype=np.int64)
+
+
+def speaker_balanced_subset(indices: np.ndarray, speakers: np.ndarray, n: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    by_speaker: dict[str, list[int]] = {}
+    for idx in indices.tolist():
+        by_speaker.setdefault(str(speakers[idx]), []).append(int(idx))
+    for values in by_speaker.values():
+        rng.shuffle(values)
+    selected: list[int] = []
+    names = sorted(by_speaker)
+    cursor = 0
+    while len(selected) < min(n, len(indices)) and names:
+        name = names[cursor % len(names)]
+        if by_speaker[name]:
+            selected.append(by_speaker[name].pop())
+        else:
+            names.remove(name)
+            cursor -= 1
+        cursor += 1
+    return np.asarray(selected, dtype=np.int64)
+
+
+def move_batch(batch: Batch, device: torch.device) -> Batch:
+    return Batch(
+        mel=batch.mel.to(device),
+        content=batch.content.to(device),
+        tokens=batch.tokens.to(device),
+        mask=batch.mask.to(device),
+        speakers=batch.speakers,
+        indices=batch.indices.to(device),
+        crop_starts=batch.crop_starts.to(device),
+        ssl_L0=batch.ssl_L0.to(device),
+        ssl_L4=batch.ssl_L4.to(device),
+        ssl_L8=batch.ssl_L8.to(device),
+    )

@@ -1,8 +1,8 @@
 """MioCodec bridge — load the frozen MioCodec model, audio IO, speaker extraction.
 
-Single home for what `eval_mcs_trans_audio.py` and the cache/voicebank scripts all
-needed (was duplicated as load_mio / load_wave / write_wave / SAMPLE_RATE, plus the
-chunked speaker-embedding extraction).
+Single home for what the cache / voicebank / evaluate scripts all needed (was
+duplicated as load_mio / load_wave / SAMPLE_RATE, plus the chunked
+speaker-embedding extraction).
 """
 
 from __future__ import annotations
@@ -45,12 +45,6 @@ def load_wave(path: Path, sample_rate: int, max_seconds: float | None = None) ->
     if max_seconds is not None:
         wav = wav[: int(round(max_seconds * sample_rate))]
     return wav.contiguous().float()
-
-
-def write_wave(path: Path, wav: torch.Tensor, sample_rate: int) -> None:
-    import soundfile as sf
-    path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), wav.detach().cpu().float().numpy(), sample_rate)
 
 
 def load_mio(device):

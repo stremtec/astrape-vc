@@ -6,8 +6,8 @@
                    chunked + energy-gated + averaged over several utterances.
 
 Examples:
-  .venv/bin/python cache.py --what wavlm --limit 0
-  .venv/bin/python cache.py --what speakers --utts-per-speaker 8
+  .venv/bin/python -m astrape.cache --what wavlm --limit 0
+  .venv/bin/python -m astrape.cache --what speakers --utts-per-speaker 8
 """
 
 import argparse
@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 
-from astrape.miocodec import load_mio, load_wave, SAMPLE_RATE, extract_chunk_embeddings
+from .miocodec import load_mio, load_wave, SAMPLE_RATE, extract_chunk_embeddings
 
 
 def cache_wavlm(args):

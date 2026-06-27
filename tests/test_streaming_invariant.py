@@ -20,8 +20,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "external" / "MioCodec" / "src"))
 
-from mcs_common import CausalConv1d
-from train_mcs_q2d2 import MCSTransQ2D2Config, MCSTransQ2D2
+from astrape.nn import CausalConv1d
+from astrape.encoder import MCSTransQ2D2Config, MCSTransQ2D2
 
 B, C_IN, C_OUT, T = 2, 80, 320, 100
 TOL = 1e-4  # fp32 tolerance
@@ -152,7 +152,7 @@ def test_encoder_future_padding_invariance(device: torch.device) -> None:
 
 def test_stem_causality(device: torch.device) -> None:
     """The full conv stem (no transformer) must be strictly causal."""
-    from mcs_common import DepthwiseResidualBlock, CellDownsample
+    from astrape.encoder import DepthwiseResidualBlock, CellDownsample
 
     config = MCSTransQ2D2Config(
         n_layers=2, stem_block_type="depthwise",

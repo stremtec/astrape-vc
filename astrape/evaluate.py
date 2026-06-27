@@ -8,8 +8,8 @@ import torch, torchaudio, argparse
 import numpy as np
 from pathlib import Path
 
-from astrape.miocodec import load_mio, load_wave, SAMPLE_RATE
-from train_mcs_q2d2 import MCSTransQ2D2Config, MCSTransQ2D2
+from .miocodec import load_mio, load_wave, SAMPLE_RATE
+from .encoder import MCSTransQ2D2Config, MCSTransQ2D2
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 MEL_HOP = 882  # 50Hz at 44.1kHz
@@ -93,7 +93,7 @@ def main():
     # Load target voicebank
     tgt_path = Path(args.target)
     if tgt_path.suffix == ".astrape":
-        from astrape.voicebank import VoiceBank
+        from .voicebank import VoiceBank
         vb = VoiceBank.load(tgt_path)
         global_emb = vb.global_embedding.float().to(DEVICE)
         print(f"VoiceBank: {vb.source_path or tgt_path.name}", flush=True)

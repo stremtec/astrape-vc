@@ -4,9 +4,9 @@ Checks all NPZ and WavLM CNN cache files. Reports issues.
 With --repair, auto-regenerates broken/missing files from source audio.
 
 Usage:
-  .venv/bin/python check_cache.py           # check only
-  .venv/bin/python check_cache.py --repair  # check + fix broken files
-  .venv/bin/python check_cache.py --wavlm-only  # check only WavLM CNN cache
+  .venv/bin/python -m astrape.check_cache           # check only
+  .venv/bin/python -m astrape.check_cache --repair  # check + fix broken files
+  .venv/bin/python -m astrape.check_cache --wavlm-only  # check only WavLM CNN cache
 """
 import sys, warnings, logging, argparse, time
 warnings.filterwarnings('ignore'); logging.disable(logging.INFO)
@@ -73,7 +73,7 @@ def check_wavlm(data_dir, repair=False, srcs=None, meta=None, subdir='wavlm_L4_2
 def repair_files(broken, missing, data_dir, srcs, subdir='wavlm_L4_200hz'):
     """Auto-repair broken WavLM cache files (L4 raw 200Hz recipe).
 
-    Regenerates with the SAME extraction as cache_wavlm_L4_raw.py — resample to
+    Regenerates with the SAME extraction as `astrape.cache --what wavlm` — resample to
     16kHz, run the first 5 conv layers (L4, 200Hz), save (T, 512).  This matches
     the wavlm_L4_200hz cache the StridingAdapter encoder consumes (the previous
     recipe fed 44.1kHz audio through the full CNN + 3× avg-pool, which is wrong
@@ -82,7 +82,7 @@ def repair_files(broken, missing, data_dir, srcs, subdir='wavlm_L4_200hz'):
     if not (broken or missing):
         return
     print(f'\nRepairing {len(broken)} broken + {len(missing)} missing files...')
-    from astrape.miocodec import load_mio, load_wave, SAMPLE_RATE
+    from .miocodec import load_mio, load_wave, SAMPLE_RATE
     import torch, torchaudio
     import torch.nn.functional as F
 

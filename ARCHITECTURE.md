@@ -256,7 +256,7 @@ same review were also fixed.)
 
 - **Issue identified.** The 200 Hz→50 Hz adapter was
   `CausalConv1d(512→256, kernel=2, stride=4, groups=256)`
-  (`WavLMFrontendAdapter` in `train_mcs_q2d2.py`). With `kernel < stride`, each
+  (`WavLMFrontendAdapter` in `astrape/encoder.py`). With `kernel < stride`, each
   output frame `j` read only input frames `4j-1, 4j`; frames `4j+1, 4j+2`
   contributed to *no* output. Roughly half of the cached self-supervised
   features were silently discarded before the encoder ever saw them. (WavLM's
@@ -293,9 +293,9 @@ same review were also fixed.)
   that weakens the adversarial disentanglement. The mask was already computed, so
   the fix is near-free and removes a length-dependent bias from training.
 
-### #3 — `check_cache.py` integrity guard pointed at the wrong cache  ✅ Implemented
+### #3 — `astrape/check_cache.py` integrity guard pointed at the wrong cache  ✅ Implemented
 
-- **Issue identified.** `check_cache.py` exists to catch caches that get
+- **Issue identified.** `astrape/check_cache.py` exists to catch caches that get
   corrupted/truncated *after* extraction — a valid and active purpose. But it
   hard-coded the `wavlm_cnn` directory and a 44.1 kHz / 3×-avg-pool repair recipe,
   both of which predate the current `wavlm_16k` / `wavlm_L4` / `wavlm_L4_200hz`
@@ -306,7 +306,7 @@ same review were also fixed.)
   rate-agnostic integrity check (exists / loads / 2-D / 512-channel / not
   truncated) covers the active cache, and rewrote `--repair` to use the L4-raw
   200 Hz extraction (resample→16 kHz, 5 conv layers, save `(T, 512)`) matching
-  `cache.py --what wavlm`.
+  `astrape.cache --what wavlm`.
 - **Reasoning behind it.** The tool's purpose is right; only its target and
   repair recipe had drifted. Re-pointing it makes the corruption guard actually
   cover the cache the StridingAdapter encoder trains on, and makes `--repair`
@@ -422,7 +422,7 @@ Comfortably inside the ~50 ms budget with ~20 ms to spare.
 |------|------|----------|
 | `astrape/decoder.py` | `CausalDecoderV5` (+SnakeBeta, learned causal upsampler, dilated SnakeBeta conv stack, optional `HarmonicComb` NSF) | **15.9 M** params (16.7 M w/ NSF); **strictly causal (future→0.00e+00)**; iSTFT 14.3 ms |
 | `astrape/discriminators.py` | MPD(2,3,5,7,11) + MSD(×3), LSGAN + feature-matching losses | 70.7 M (training-only); fwd/bwd OK, MPS-safe |
-| `train_decoder.py` | 2-phase curriculum (warmup→adversarial), reuses frozen encoder + `Phase0Dataset` | both phases run fwd/bwd with G-gradient |
+| `astrape/train_decoder.py` | 2-phase curriculum (warmup→adversarial), reuses frozen encoder + `Phase0Dataset` | both phases run fwd/bwd with G-gradient |
 
 The naturalness gain comes almost entirely from **adversarial training + NSF +
 learned upsampler** (all 0 latency) — the latency budget was never the binding

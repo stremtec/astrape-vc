@@ -8,10 +8,10 @@ Curriculum
       + MPD/MSD discriminators (LSGAN) + feature matching, recon kept as anchor.
       (Optionally enable NSF via --use-nsf for the harmonic source.)
 
-Reuses the frozen encoder + data pipeline from train_decoder.py.
+Reuses the frozen encoder + data pipeline from astrape.data / astrape.encoder.
 
 Usage:
-  .venv/bin/python train_decoder_v5.py --device mps --epochs 60 --warmup-epochs 10 \
+  .venv/bin/python -m astrape.train_decoder --device mps --epochs 60 --warmup-epochs 10 \
       --encoder-ckpt /Volumes/UNTITLED/btrv5_checkpoints/striding_8l_200hz/striding_8l_200hz.best.pt \
       --wavlm-dir wavlm_L4_200hz --num-workers 6
 """
@@ -32,9 +32,9 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
 
-from astrape.data import Phase0Dataset, collate_phase0, gaussian_blur_wave
-from astrape.decoder import CausalDecoderV5, CausalDecoderV5Config
-from astrape.discriminators import (
+from .data import Phase0Dataset, collate_phase0, gaussian_blur_wave
+from .decoder import CausalDecoderV5, CausalDecoderV5Config
+from .discriminators import (
     CombinedDiscriminator, discriminator_loss, generator_adv_loss, feature_matching_loss,
 )
 
@@ -63,7 +63,7 @@ def mrstft(pred: torch.Tensor, tgt: torch.Tensor, nffts) -> torch.Tensor:
 
 def load_encoder(checkpoint_path, device="cpu"):
     """Load the frozen Q2D2 encoder from a checkpoint (Phase 2: → astrape.encoder)."""
-    from train_mcs_q2d2 import MCSTransQ2D2Config, MCSTransQ2D2
+    from .encoder import MCSTransQ2D2Config, MCSTransQ2D2
     ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     scfg = ck.get("config", {})
     scfg2 = {k: tuple(v) if isinstance(v, list) else v
@@ -129,12 +129,12 @@ def main():
     n_samples = int(meta["n_samples"])
     source_files = meta["source_files"][:n_samples].astype(str)
     spk_names = meta["spk_names"]
-    # Per-speaker centroids (run cache_speaker_embeddings.py first) — covers all
+    # Per-speaker centroids (run `astrape.cache --what speakers` first) — covers all
     # speakers, unlike spk_1k.npy which only has the first ~4 (VCTK is grouped).
     cz_path = data_dir / "spk_centroids.npz"
     if not cz_path.exists():
         raise SystemExit(
-            f"Missing {cz_path}.\n  Run first: .venv/bin/python cache_speaker_embeddings.py")
+            f"Missing {cz_path}.\n  Run first: .venv/bin/python -m astrape.cache --what speakers")
     cz = np.load(cz_path, allow_pickle=False)
     speaker_emb_map = {str(s): torch.from_numpy(e).float()
                        for s, e in zip(cz["speakers"], cz["embeddings"])}
