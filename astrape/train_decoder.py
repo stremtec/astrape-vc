@@ -190,7 +190,7 @@ def main():
         decoder.train(); disc.train()
         # On-device accumulators → no per-step MPS↔CPU sync (only .item() at log).
         acc = {k: torch.zeros((), device=device) for k in ("recon", "adv", "fm", "d")}
-        steps = 0
+        steps = 0; skipped = 0
         for wavlm, audio, speaker, _idx in train_loader:
             steps += 1
             if steps > args.steps_per_epoch:
@@ -226,8 +226,9 @@ def main():
                 d_loss = discriminator_loss(real_lg, fake_lg)
                 opt_d.zero_grad(set_to_none=True)
                 d_loss.backward()
-                torch.nn.utils.clip_grad_norm_(disc.parameters(), args.clip_grad)
-                opt_d.step()
+                dnorm = torch.nn.utils.clip_grad_norm_(disc.parameters(), args.clip_grad)
+                if torch.isfinite(dnorm):
+                    opt_d.step()
 
                 # ── G step ──
                 fake_lg, fake_fm = disc(pred_w)
@@ -235,22 +236,30 @@ def main():
                 adv = generator_adv_loss(fake_lg)
                 fm = feature_matching_loss(real_fm, fake_fm)
                 g_loss = args.adv_weight * adv + args.fm_weight * fm + recon
-                acc["adv"] += adv.detach(); acc["fm"] += fm.detach(); acc["d"] += d_loss.detach()
             else:
+                adv = fm = d_loss = pred.new_zeros(())
                 g_loss = recon
 
             opt_g.zero_grad(set_to_none=True)
             g_loss.backward()
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), args.clip_grad)
+            gnorm = torch.nn.utils.clip_grad_norm_(decoder.parameters(), args.clip_grad)
+            if not torch.isfinite(gnorm):
+                # Rare non-finite gradient (corrupt cache sample / numerical edge):
+                # skip the update so ONE bad batch can't permanently poison the
+                # weights — the failure mode behind recon→nan-forever.
+                opt_g.zero_grad(set_to_none=True)
+                skipped += 1
+                continue
             opt_g.step()
-            acc["recon"] += recon.detach()
+            acc["recon"] += recon.detach(); acc["adv"] += adv.detach()
+            acc["fm"] += fm.detach(); acc["d"] += d_loss.detach()
 
             if steps % 100 == 0:
-                d = steps
+                d = max(steps - skipped, 1)
                 tag = "ADV" if adversarial else "REC"
                 print(f"E{ep:02d}[{tag}] {steps:04d}/{args.steps_per_epoch} "
                       f"recon={acc['recon'].item()/d:.3f} adv={acc['adv'].item()/d:.3f} "
-                      f"fm={acc['fm'].item()/d:.3f} d={acc['d'].item()/d:.3f} "
+                      f"fm={acc['fm'].item()/d:.3f} d={acc['d'].item()/d:.3f} skip={skipped} "
                       f"{(time.time()-t0)/((ep-start_epoch)*args.steps_per_epoch + steps):.3f}s/step",
                       flush=True)
 
@@ -265,7 +274,8 @@ def main():
             torch.save(ckpt, args.out_dir / f"epoch{ep:03d}.pt")
         (args.out_dir / "summary.json").write_text(json.dumps(
             {"epoch": ep, "phase": "adversarial" if adversarial else "warmup",
-             **{k: v / max(steps, 1) for k, v in tot.items()}}, indent=2) + "\n")
+             "skipped": skipped,
+             **{k: v / max(steps - skipped, 1) for k, v in tot.items()}}, indent=2) + "\n")
         print(f"E{ep:02d} done ({'ADV' if adversarial else 'REC'})", flush=True)
 
     print(f"Done. elapsed={time.time()-t0:.0f}s", flush=True)
