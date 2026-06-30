@@ -137,7 +137,7 @@ class Phase0Dataset(Dataset):
                 spk = self.speaker_emb_map.get(spk_id, self._spk_fallback).clone()
             else:
                 spk = self.spk_embeds[self.spk_to_emb.get(spk_id, 0)].clone()
-            return {"wavlm": feat, "audio": wave, "speaker": spk, "index": idx}
+            return {"wavlm": feat, "audio": wave, "speaker": spk, "idx": idx}
         src_path = str(self.source_files[idx])
         wave, sr = _io_retry(lambda: sf.read(src_path, dtype="float32"))
         wave = torch.from_numpy(np.asarray(wave))
