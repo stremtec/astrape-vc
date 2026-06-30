@@ -68,7 +68,7 @@ def main():
     split = int(len(idx) * 0.95)
     ds = Phase0Dataset(idx[:split], args.data_dir / args.wavlm_dir, src, None, spk_names,
                        args.max_frames, args.seed, wavlm_rate=args.wavlm_rate, speaker_emb_map=semap,
-                       content_dir=args.data_dir / args.content_dir)
+                       content_dir=args.data_dir / args.content_dir, load_audio=False)
     loader = DataLoader(ds, args.batch_size, shuffle=True, num_workers=args.num_workers,
                         persistent_workers=args.num_workers > 0, collate_fn=collate_phase0, drop_last=True)
 
