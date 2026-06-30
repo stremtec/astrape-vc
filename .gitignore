@@ -76,3 +76,4 @@ astrape/encoding_gap.py
 astrape/train_decoder_v6.py
 .DS_Store
 outputs/
+ARCHITECTURE.md
