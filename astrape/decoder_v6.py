@@ -317,37 +317,39 @@ class InterpSmooth(nn.Module):
 # ═══════════════════════════════════════════════════════════════════
 
 class ISTFTHead2D(nn.Module):
-    """Projects time-features → freq bins → Conv2d(T,F) → real+imag → iSTFT.
+    """Projects time-features → freq bins → Conv2d(T,F) → mag+phase → iSTFT.
 
-    Key: predicts real+imag directly (NOT mag+phase). This avoids the phase
-    wrapping ambiguity (atan2), sin/cos gradient blur, and lets the network
-    directly shape the complex spectrum. The complex_stft_loss naturally
-    supervises both magnitude and phase through the real+imag representation.
+    Two-branch design from shared Conv2d features:
+    - magnitude logits → exp → magnitude (supervised by MR-STFT, Mel)
+    - phase → cos/sin → complex → iSTFT (supervised by cSTFT, anti-wrap phase)
+    The shared Conv2d backbone learns frequency-axis coherence for both.
     """
     def __init__(self, in_dim: int, n_freq: int, hidden: int = 32):
         super().__init__()
         self.n_freq = n_freq
         self.proj = nn.Linear(in_dim, hidden * n_freq)
+        # Shared backbone
         self.conv = nn.Sequential(
-            nn.Conv2d(hidden, hidden, (3, 5), padding=(0, 2)),  # T×F conv
+            nn.Conv2d(hidden, hidden, (3, 5), padding=(0, 2)),
             nn.GELU(),
             nn.Conv2d(hidden, hidden, (3, 5), padding=(0, 2)),
             nn.GELU(),
-            nn.Conv2d(hidden, 2, 1),                             # → real, imag
         )
+        # Separate heads
+        self.mag_head = nn.Conv2d(hidden, 1, 1)    # → magnitude logits
+        self.phase_head = nn.Conv2d(hidden, 1, 1)  # → phase
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """x: (B, T, in_dim) → (real, imag) each (B, n_freq, T)"""
+        """x: (B, T, in_dim) → (mag_log, phase) each (B, n_freq, T)"""
         B, T, _ = x.shape
         h = self.proj(x)                                # (B, T, hidden*n_freq)
         h = h.reshape(B, T, self.n_freq, -1)            # (B, T, n_freq, hidden)
         h = h.permute(0, 3, 1, 2)                       # (B, hidden, T, n_freq)
-        # Causal left-pad: pad time axis by 2 frames on left (kernel_3→2 past + current)
-        h = F.pad(h, (0, 0, 2, 0))                     # (freq_left, freq_right, time_left, time_right)
-        h = self.conv(h)                                 # (B, 2, T, n_freq)
-        h = h.permute(0, 1, 3, 2)                       # (B, 2, n_freq, T)
-        real, imag = h[:, 0], h[:, 1]                   # (B, n_freq, T) each
-        return real, imag
+        h = F.pad(h, (0, 0, 2, 0))                     # causal left-pad time
+        h = self.conv(h)                                 # shared backbone
+        mag_log = self.mag_head(h).squeeze(1)            # (B, T, n_freq) → (B, n_freq, T)
+        phase = self.phase_head(h).squeeze(1)            # (B, n_freq, T)
+        return mag_log.permute(0, 2, 1), phase.permute(0, 2, 1)  # → (B, n_freq, T)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -503,13 +505,12 @@ class CausalDecoderV6(nn.Module):
         # No stair-step, no phase jumps — anti-aliased throughout
         h = self.frac_up(h)  # (B, W, stft_length)
 
-        # ⑥ Bridge + ISTFT — real+imag direct prediction (no mag/phase separation)
+        # ⑥ Bridge + ISTFT — two-branch: mag(log)+phase from shared Conv2d backbone
         h = self.istft_bridge(h).transpose(1, 2)         # (B, stft_len, bridge_dim)
-        real, imag = self.istft_head_2d(h)                # (B, n_freq, stft_len) each
-        wav = self.istft(torch.complex(real, imag))
+        mag_log, phase = self.istft_head_2d(h)            # (B, n_freq, stft_len) each
+        mag = torch.exp(mag_log).clamp(max=1e2)
+        wav = self.istft(torch.complex(mag * torch.cos(phase), mag * torch.sin(phase)))
         if return_spec:
-            mag = torch.sqrt(real.pow(2) + imag.pow(2))
-            phase = torch.atan2(imag, real)
             return wav, mag, phase
         return wav
 
