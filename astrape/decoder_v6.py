@@ -260,6 +260,12 @@ class CausalDecoderV6Config:
     # ① Content projection
     proj_dim: int = 384           # 768→384 (content lives in 384d after projection)
 
+    # ① Content prenet: causal transformer interprets content @25Hz (mirrors teacher's wave_prenet)
+    prenet_layers: int = 4        # causal transformer layers before upsampling
+    prenet_heads: int = 8
+    prenet_window: int = 65       # odd, ~2.5s backward context @25Hz
+    prenet_dropout: float = 0.0
+
     # ② Prosody LSTM (causal substitute for teacher's bidirectional prenet)
     prosody_hidden: int = 384
     prosody_cond_dim: int = 128   # prosody conditioning vector dim
@@ -372,6 +378,15 @@ class CausalDecoderV6(nn.Module):
         # ① Content projection: 768→384 (no speaker — pure content)
         self.content_proj = nn.Linear(c.content_dim, D, bias=False)
 
+        # ① Content prenet: causal transformer interprets content @25Hz
+        #    No speaker conditioning (pure content, mirrors teacher's wave_prenet)
+        from miocodec.module.transformer import Transformer
+        self.prenet = Transformer(
+            dim=D, n_layers=c.prenet_layers, n_heads=c.prenet_heads,
+            output_dim=D, window_size=c.prenet_window, causal=True,
+            use_rope=True, rope_theta=10000.0, dropout=c.prenet_dropout,
+            use_flash_attention=False)
+
         # ② Prosody LSTM: causal RNN fuses content+speaker → conditioning
         self.prosody = ProsodyLSTM(
             content_dim=c.content_dim,
@@ -455,6 +470,9 @@ class CausalDecoderV6(nn.Module):
         # ② Prosody embedding: LSTM reads scaled content+speaker prefix
         prosody_cond = self.prosody(h, speaker)          # (B, T, prosody_cond_dim)
         h = self.content_proj(h)                         # (B, T, 384)
+
+        # ① Content prenet: causal transformer interprets @25Hz (mirrors teacher wave_prenet)
+        h = self.prenet(h)                               # (B, T, 384)
 
         # ③ Content smoothing @25Hz
         h = h.transpose(1, 2)                            # (B, 384, T)
