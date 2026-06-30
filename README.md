@@ -2,7 +2,7 @@
 
 Strict-causal, zero-shot voice conversion VST — real-time on Apple Silicon (MPS).
 
-| | |
+
 |---|---|
 | cos768 | **0.935** (probe, 8L StridingAdapter) |
 | Encoder params | 24.9M |
