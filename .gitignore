@@ -8,72 +8,17 @@ checkpoints/
 *.npz
 voicebanks/
 
-# Model architecture (closed-source)
-astrape/encoder.py
-astrape/decoder.py
-astrape/causal_decoder.py
-astrape/decoder_simple.py
-astrape/mcs_decoder.py
-astrape/causal_wave_decoder.py
-astrape/quantizer.py
-astrape/nn.py
-astrape/losses.py
-astrape/discriminators.py
-astrape/mamba_block.py
-astrape/mamba.py
-astrape/cache.py
-astrape/streaming.py
-astrape/streaming_state.py
-astrape/streaming_pipeline.py
-
-# Training scripts (closed-source)
-astrape/train_encoder.py
-astrape/train_decoder.py
-astrape/train_causal_wave.py
-astrape/train_mcs_decoder.py
-astrape/fsq.py
-astrape/audio.py
-astrape/wave_decoder.py
-astrape/light_decoder.py
-astrape/dual_decoder.py
-
-# Docs (closed-source)
-ARCHITECTURE.md
-cdecoder.md
-devlog.md
-CLAUDE.md
+# Docs
+*.md
+!README.md
 
 # Build artifacts
 __pycache__/
 *.pyc
 .venv/
 
-# External dependency (frozen, tracked as-is)
-!external/
-!external/MioCodec/
-
-# VST infrastructure (public)
-!astrape/__init__.py
-!astrape/voicebank.py
-!astrape/evaluate.py
-!astrape/infer.py
-!astrape/build_voicebank.py
-!astrape/data.py
-!astrape/miocodec.py
-!astrape/check_cache.py
-
-# Tests
-!tests/
-
-# Ignore all .md except README
-*.md
-!README.md
-
-export.py
-mamba.py.save
-astrape/decoder_v6.py
-astrape/encoding_gap.py
-astrape/train_decoder_v6.py
+# Misc
 .DS_Store
 outputs/
-ARCHITECTURE.md
+export.py
+mamba.py.save
