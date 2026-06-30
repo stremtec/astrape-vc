@@ -168,14 +168,14 @@ def main():
             {"epoch": ep, "skipped": skipped,
              **{k: v.item() / max(steps - skipped, 1) for k, v in acc.items()}}, indent=2) + "\n")
         print(f"E{ep:02d} done", flush=True)
-        # ── eval: waveform cosine vs teacher ──
-        if ep % 5 == 0 or ep == args.epochs - 1:
-            dec.eval()
-            wave_cos, mel_cos = evaluate_vs_teacher(dec, mio, loader, device,
-                                                     mel_fn, num_batches=20)
-            print(f"  eval: wave_cos={wave_cos:.4f}  mel_cos={mel_cos:.4f}", flush=True)
-            (args.out_dir / "eval.json").write_text(json.dumps(
-                {"epoch": ep, "wave_cos": wave_cos, "mel_cos": mel_cos}, indent=2) + "\n")
+        # ── eval: waveform cosine vs teacher (every epoch) ──
+        dec.eval()
+        wave_cos, mel_cos = evaluate_vs_teacher(dec, mio, loader, device,
+                                                 mel_fn, num_batches=20)
+        print(f"  eval: wave_cos={wave_cos:.4f}  mel_cos={mel_cos:.4f}", flush=True)
+        (args.out_dir / "eval.json").write_text(json.dumps(
+            {"epoch": ep, "wave_cos": wave_cos, "mel_cos": mel_cos}, indent=2) + "\n")
+        dec.train()
     print(f"Done. {time.time()-t0:.0f}s", flush=True)
 
 
