@@ -387,9 +387,9 @@ class CausalDecoderV6(nn.Module):
             use_rope=True, rope_theta=10000.0, dropout=c.prenet_dropout,
             use_flash_attention=False)
 
-        # ② Prosody LSTM: causal RNN fuses content+speaker → conditioning
+        # ② Prosody LSTM: causal RNN fuses prenet-interpreted content+speaker
         self.prosody = ProsodyLSTM(
-            content_dim=c.content_dim,
+            content_dim=D,   # prenet output dim (384), not raw 768
             speaker_dim=c.speaker_dim,
             hidden=c.prosody_hidden,
             cond_dim=c.prosody_cond_dim,
@@ -466,13 +466,14 @@ class CausalDecoderV6(nn.Module):
 
         # ① Scale content first, then use same scaled content everywhere
         h = content * self.input_scale.to(dtype=content.dtype)
-
-        # ② Prosody embedding: LSTM reads scaled content+speaker prefix
-        prosody_cond = self.prosody(h, speaker)          # (B, T, prosody_cond_dim)
         h = self.content_proj(h)                         # (B, T, 384)
 
         # ① Content prenet: causal transformer interprets @25Hz (mirrors teacher wave_prenet)
         h = self.prenet(h)                               # (B, T, 384)
+
+        # ② Prosody embedding: LSTM reads PRENET-interpreted content+speaker
+        #    (richer representation than raw scaled content)
+        prosody_cond = self.prosody(h, speaker)          # (B, T, prosody_cond_dim)
 
         # ③ Content smoothing @25Hz
         h = h.transpose(1, 2)                            # (B, 384, T)
