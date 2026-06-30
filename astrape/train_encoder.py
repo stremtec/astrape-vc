@@ -672,15 +672,22 @@ def main() -> None:
                 totals[key] = totals.get(key, 0.0) + value
 
             if step % args.log_every == 0 or step == args.steps_per_epoch:
-                denom = max(step, 1)
+                s = max(step, 1)
                 elapsed = time.time() - step_started
+                # Progress bar + ETA
+                pct = step * 100 // args.steps_per_epoch
+                bar = '\u2588' * (pct // 5) + '\u2591' * (20 - pct // 5)
+                total_epochs = max(1, args.epochs - start_epoch)
+                total_steps = total_epochs * args.steps_per_epoch
+                steps_done = (epoch - start_epoch) * args.steps_per_epoch + step
+                sps = elapsed / s
+                eta_h = sps * (total_steps - steps_done) / 3600
                 print(
-                    f"E{epoch:03d} step={step:04d}/{args.steps_per_epoch} "
-                    f"loss={totals['loss']/denom:.4f} "
-                    f"cos768={totals['cos768']/denom:.4f} "
-                    f"l1={totals.get('content_l1',0)/denom:.4f} "
-                    f"usage={totals.get('q2d2_usage',0)/denom:.3f} "
-                    f"{elapsed/max(step,1):.3f}s/step",
+                    f"E{epoch:03d} [{bar}] {pct:3d}% "
+                    f"| loss={totals['loss']/s:.4f} cos={totals['cos768']/s:.4f} "
+                    f"l1={totals.get('content_l1',0)/s:.4f} "
+                    f"use={totals.get('q2d2_usage',0)/s:.3f} "
+                    f"| {sps:.2f}s | ETA {eta_h:.1f}h",
                     flush=True,
                 )
 
@@ -694,11 +701,15 @@ def main() -> None:
             "elapsed_seconds": time.time() - run_started,
         }
 
+        pc = probe.get('cos768', 0)
+        ep_done = epoch - start_epoch + 1
+        pct_done = ep_done * 100 // max(1, args.epochs - start_epoch)
+        elapsed_h = (time.time() - run_started) / 3600
         print(
-            f"E{epoch:03d} probe cos768={probe.get('cos768',0):.4f} "
-            f"loss={probe.get('loss',0):.4f} "
-            f"l1={probe.get('content_l1',0):.4f} "
-            f"q2d2_usage={probe.get('q2d2_usage',0):.3f}",
+            f"E{epoch:03d} \u2713 probe cos={pc:.4f} "
+            f"loss={probe.get('loss',0):.1f} l1={probe.get('content_l1',0):.4f} "
+            f"use={probe.get('q2d2_usage',0):.3f} "
+            f"| {pct_done}% done \u00b7 {elapsed_h:.1f}h",
             flush=True,
         )
 
