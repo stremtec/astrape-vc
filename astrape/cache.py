@@ -84,20 +84,73 @@ def cache_speakers(args):
     print(f"Wrote {out}: {len(speakers)} speaker centroids (128-d)")
 
 
+def _load_encoder(ckpt, device):
+    """Frozen Q2D2 encoder from a checkpoint (same recipe as train_decoder.load_encoder)."""
+    from .encoder import MCSTransQ2D2Config, MCSTransQ2D2
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    scfg = {k: tuple(v) if isinstance(v, list) else v
+            for k, v in ck.get("config", {}).items() if not k.startswith("_")}
+    scfg["use_wavlm_frontend"] = True
+    known = set(MCSTransQ2D2Config.__dataclass_fields__.keys())
+    model = MCSTransQ2D2(MCSTransQ2D2Config(**{k: v for k, v in scfg.items() if k in known}))
+    model.load_state_dict(ck["state_dict"], strict=False)
+    return model.to(device).eval()
+
+
+def cache_content(args):
+    """FULL-context content per clip: run the frozen encoder over each clip's WHOLE WavLM
+    cache → content (T_content, 768). The decoder then trains on cropped content windows
+    that carry their real preceding context (matches streaming inference) instead of
+    re-encoding short 50-frame WavLM crops (cold-start) every step."""
+    data_dir = Path(args.data_dir)
+    meta = np.load(data_dir / "meta.npz", allow_pickle=False)
+    n = int(meta["n_samples"])
+    end = n if args.limit == 0 else min(n, args.start + args.limit)
+    wl_dir = data_dir / "wavlm_L4_200hz"
+    out_dir = Path(args.out_dir) if args.out_dir else data_dir / args.content_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not args.encoder_ckpt:
+        raise SystemExit("--encoder-ckpt is required for --what content")
+    enc = _load_encoder(args.encoder_ckpt, args.device)
+    print(f"Caching full-context content → {out_dir}: {args.start}..{end-1} "
+          f"({end-args.start} total)", flush=True)
+    done = 0
+    for i in range(args.start, end):
+        out_path = out_dir / f"s_{i:05d}.npy"
+        if out_path.exists():
+            continue
+        wl_path = wl_dir / f"s_{i:05d}.npy"
+        if not wl_path.exists():
+            continue
+        wl = torch.from_numpy(np.load(wl_path, allow_pickle=False)).float().to(args.device)  # (T,512)
+        with torch.no_grad():
+            mask = torch.ones(1, wl.shape[0] // 2, dtype=torch.bool, device=args.device)
+            content = enc(wl.unsqueeze(0).transpose(1, 2), padding_mask=mask)["projected"]   # (1,768,Tc)
+        np.save(out_path, content.squeeze(0).transpose(0, 1).cpu().numpy().astype(np.float32))  # (Tc,768)
+        done += 1
+        if done % 500 == 0:
+            print(f"  {done}/{end - args.start}", flush=True)
+    print(f"Done: {done} content files cached in {out_dir}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--what", choices=["wavlm", "speakers"], required=True)
+    ap.add_argument("--what", choices=["wavlm", "speakers", "content"], required=True)
     ap.add_argument("--data-dir", default="data/mio_vctk_full_compact")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out-dir", default=None)
-    # wavlm
+    # wavlm / content
     ap.add_argument("--max-s", type=float, default=6.0)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
+    # content
+    ap.add_argument("--encoder-ckpt", default=None, help="frozen encoder checkpoint (for --what content)")
+    ap.add_argument("--content-dir", default="content_striding_8l_200hz",
+                    help="output subdir under data-dir for cached content")
     # speakers
     ap.add_argument("--utts-per-speaker", type=int, default=8)
     args = ap.parse_args()
-    (cache_wavlm if args.what == "wavlm" else cache_speakers)(args)
+    {"wavlm": cache_wavlm, "speakers": cache_speakers, "content": cache_content}[args.what](args)
 
 
 if __name__ == "__main__":

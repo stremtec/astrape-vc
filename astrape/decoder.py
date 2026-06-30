@@ -128,7 +128,7 @@ class HarmonicComb(nn.Module):
         diff = self.freqs.view(1, 1, -1, 1) - centers.unsqueeze(2)   # (B,T,F,K)
         comb = torch.exp(-(diff / self.bandwidth).pow(2)).sum(-1)    # (B,T,F)
         comb = comb * voiced                                          # gate by voicing
-        return torch.log(comb + 1e-4), f0.squeeze(-1)                 # (B,T,F), (B,T)
+        return torch.log(comb + 1e-4), f0.squeeze(-1), voiced.squeeze(-1)  # (B,T,F),(B,T),(B,T)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -151,7 +151,7 @@ class CausalDecoderV5Config:
     prenet_rope_theta: float = 10000.0
     prenet_dropout: float = 0.0
 
-    upsample_factor: int = 7            # 25→175Hz (matches hop=252)
+    upsample_factor: int = 18           # 25→450Hz (matches hop=98, the MioCodec teacher)
 
     convnet_dim: int = 384
     convnet_dilations: tuple[int, ...] = (1, 2, 4, 1, 2, 4)   # v4: 2 shallow k=3
@@ -162,8 +162,11 @@ class CausalDecoderV5Config:
     nsf_harmonics: int = 16
 
     istft_bridge_dim: int = 512
-    n_fft: int = 1512                   # v4: 1008  (→ 14.3ms algorithmic latency)
-    hop_length: int = 252               # 44100/252 = 175Hz = 7×25, unchanged
+    # Match the MioCodec teacher's iSTFT (n_fft=392, hop=98) → enables direct mag/phase
+    # distillation from the teacher's head AND a short 8.9ms window (crisp, no smear) →
+    # algorithmic latency (392-98)/2/44100 = 3.3ms (was 14.3ms at 1512/252).
+    n_fft: int = 392
+    hop_length: int = 98                # 44100/98 = 450Hz = 18×25
     istft_padding: str = "same"
 
 
@@ -216,7 +219,8 @@ class CausalDecoderV5(nn.Module):
                    / self.config.hop_length / self.config.content_rate)
 
     def forward(self, content: torch.Tensor, speaker: torch.Tensor,
-                stft_length: int | None = None) -> torch.Tensor:
+                stft_length: int | None = None, return_aux: bool = False,
+                return_spec: bool = False):
         B, T, _ = content.shape
         if stft_length is None:
             stft_length = self._compute_stft_length(T)
@@ -234,9 +238,9 @@ class CausalDecoderV5(nn.Module):
         h = self.up_proj(h.transpose(1, 2)).transpose(1, 2)   # (B, T_stft, W)
 
         # Phase 2b: NSF harmonic template (optional)
-        nsf_logmag = None
+        nsf_logmag = nsf_f0 = nsf_voiced = None
         if self.nsf is not None:
-            nsf_logmag, _f0 = self.nsf(h, speaker)       # (B, T_stft, n_freq)
+            nsf_logmag, nsf_f0, nsf_voiced = self.nsf(h, speaker)   # (B,T_stft,n_freq),(B,T),(B,T)
 
         # Phase 3: causal conv refine
         for block in self.convnet:
@@ -247,7 +251,17 @@ class CausalDecoderV5(nn.Module):
         if nsf_logmag is not None:
             h = torch.cat([h, nsf_logmag], dim=-1)
         h = self.istft_bridge(h.transpose(1, 2)).transpose(1, 2)   # (B, T_stft, bridge)
-        return self.istft_head(h)                                   # (B, samples)
+        # Inline ISTFTHead so the intermediate magnitude/phase (the value fed to the iSTFT)
+        # is exposed for direct distillation against the teacher's head (same 392/98 grid).
+        xo = self.istft_head.out(h).transpose(1, 2)                # (B, n_fft+2, T_stft)
+        mag_log, phase = xo.chunk(2, dim=1)
+        mag = torch.exp(mag_log).clamp(max=1e2)
+        wav = self.istft_head.istft(torch.complex(mag * torch.cos(phase), mag * torch.sin(phase)))
+        if return_spec:
+            return wav, mag, phase                                  # (B,samples),(B,n_freq,T),(B,n_freq,T)
+        if return_aux:
+            return wav, nsf_f0, nsf_voiced
+        return wav
 
 
 if __name__ == "__main__":

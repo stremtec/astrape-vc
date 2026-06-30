@@ -105,12 +105,18 @@ tests/test_streaming_invariant.py
 | `--forecast-weight 0.05` | predict teacher[t+1], teacher[t+2] |
 
 **3. Decoder v5** — strict-causal vocoder, 2-phase curriculum (reconstruction
-warmup → MPD/MSD adversarial, recon kept as anchor).
+warmup → MPD/MSD adversarial, recon kept as anchor). Trains on **pre-cached
+full-context content**: the frozen encoder is run once over whole clips (not re-run
+per step), so the decoder sees the SAME context it gets at streaming inference.
 ```bash
-.venv/bin/python -m astrape.train_decoder \
-  --device mps --epochs 60 --warmup-epochs 10 --num-workers 6 \
-  --wavlm-dir wavlm_L4_200hz \
+# one-time: full-context content (decoder input) + per-speaker centroids
+.venv/bin/python -m astrape.cache --what content --device mps \
   --encoder-ckpt /Volumes/UNTITLED/btrv5_checkpoints/striding_8l_200hz/striding_8l_200hz.best.pt
+.venv/bin/python -m astrape.cache --what speakers --utts-per-speaker 8
+# train (content mode — no per-step encoder forward)
+.venv/bin/python -m astrape.train_decoder \
+  --device mps --epochs 60 --warmup-epochs 10 --num-workers 4 \
+  --content-dir content_striding_8l_200hz
 ```
 
 **Inference** — build a target voicebank, then convert:

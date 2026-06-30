@@ -62,6 +62,88 @@ def mrstft(pred: torch.Tensor, tgt: torch.Tensor, nffts) -> torch.Tensor:
     return loss / len(nffts)
 
 
+def complex_stft_loss(pred: torch.Tensor, tgt: torch.Tensor, nffts) -> torch.Tensor:
+    """Multi-resolution complex-STFT L1 (real+imag) — jointly supervises magnitude AND
+    phase with smooth gradients (no angle() singularity). For teacher distillation: the
+    teacher target carries correct phase, so matching its complex spectrum transfers it.
+    CPU only (MPS torch.stft backward bug — see mrstft)."""
+    loss = pred.new_zeros(())
+    for n_fft in nffts:
+        win = torch.hann_window(n_fft, device=pred.device, dtype=pred.dtype)
+        P = torch.stft(pred, n_fft, n_fft // 4, n_fft, win, return_complex=True)
+        T = torch.stft(tgt, n_fft, n_fft // 4, n_fft, win, return_complex=True)
+        loss = loss + F.l1_loss(torch.view_as_real(P), torch.view_as_real(T))
+    return loss / len(nffts)
+
+
+def anti_wrap_phase_loss(pred: torch.Tensor, tgt: torch.Tensor,
+                         n_fft: int = 1024, hop: int = 256) -> torch.Tensor:
+    """APNet2-style anti-wrapping phase loss: instantaneous-phase (IP) + group-delay (GD),
+    each wrapped to [0, pi] and magnitude-weighted by the (clean teacher) target so phase
+    is supervised only where there is energy. Directly teaches phase the GAN learns slowly.
+    CPU only."""
+    win = torch.hann_window(n_fft, device=pred.device, dtype=pred.dtype)
+    P = torch.stft(pred, n_fft, hop, n_fft, win, return_complex=True)
+    T = torch.stft(tgt, n_fft, hop, n_fft, win, return_complex=True)
+    w = T.abs(); w = w / w.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-7)
+    pp, pt = P.angle(), T.angle()
+    aw = lambda x: torch.atan2(torch.sin(x), torch.cos(x)).abs()           # wrap → [0, pi]
+    ip = (aw(pp - pt) * w).sum() / w.sum().clamp_min(1e-7)
+    dgd = aw((pp[..., 1:, :] - pp[..., :-1, :]) - (pt[..., 1:, :] - pt[..., :-1, :]))
+    gd = (dgd * w[..., 1:, :]).sum() / w[..., 1:, :].sum().clamp_min(1e-7)  # along freq
+    return ip + gd
+
+
+def extract_f0(wave: torch.Tensor, sr: int = S, hop: int = 252, frame: int = 2048,
+               fmin: float = 50.0, fmax: float = 600.0, vthresh: float = 0.35):
+    """Vectorized FFT-autocorrelation F0 + voicing per `hop` samples (175Hz, the NSF/STFT
+    frame rate). Non-differentiable TARGET for the NSF F0 head (extracted from the teacher
+    waveform). Returns f0 (B, T) Hz and voiced (B, T) in {0,1}. CPU."""
+    w = F.pad(wave, (frame // 2, frame // 2))
+    fr = w.unfold(1, frame, hop) * torch.hann_window(frame, device=wave.device)  # (B,T,frame)
+    nfft = 2 * frame
+    ac = torch.fft.irfft(torch.fft.rfft(fr, n=nfft).abs().pow(2), n=nfft)[..., :frame]
+    ac = ac / ac[..., :1].clamp_min(1e-9)                       # normalize by lag-0
+    lmin, lmax = int(sr / fmax), int(sr / fmin)
+    peak, k = ac[..., lmin:lmax].max(dim=-1)                    # (B, T)
+    f0 = sr / (lmin + k).float()
+    energy = fr.pow(2).mean(-1).sqrt()
+    voiced = ((peak > vthresh) & (energy > 1e-3)).float()
+    return f0, voiced
+
+
+def teacher_spec(mio, content, speaker, stft_length):
+    """The teacher's predicted (magnitude, phase) at its iSTFT head — the intermediate value
+    fed to the iSTFT (the user's distillation target). Captured via a forward-pre-hook on the
+    head; with v5 on the SAME 392/98 grid the student head is distilled against it directly.
+    No grad (frozen target). mag,phase: (B, n_freq, T_stft)."""
+    cap = {}
+    handle = mio.istft_head.register_forward_pre_hook(lambda m, inp: cap.__setitem__("x", inp[0]))
+    try:
+        with torch.no_grad():
+            mio.forward_wave(content, speaker, stft_length=stft_length)
+    finally:
+        handle.remove()
+    xo = mio.istft_head.out(cap["x"]).transpose(1, 2)              # (B, n_fft+2, T)
+    mag_log, phase = xo.chunk(2, dim=1)
+    return torch.exp(mag_log).clamp(max=1e2), phase
+
+
+def spec_distill_loss(smag, sphase, tmag, tphase):
+    """Direct istft-head distillation: amplitude (log-mag L1) + anti-wrapping phase (IP +
+    group-delay), magnitude-weighted by the teacher. student/teacher (B, n_freq, T) on the
+    SAME 392/98 grid → no torch.stft (MPS-safe, on-device). Returns (amp_loss, phase_loss)."""
+    Ts = min(smag.shape[-1], tmag.shape[-1])
+    smag, sphase, tmag, tphase = smag[..., :Ts], sphase[..., :Ts], tmag[..., :Ts], tphase[..., :Ts]
+    amp = F.l1_loss(smag.clamp_min(1e-5).log(), tmag.clamp_min(1e-5).log())
+    w = tmag / tmag.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-7)
+    aw = lambda x: torch.atan2(torch.sin(x), torch.cos(x)).abs()   # wrap → [0, pi]
+    ip = (aw(sphase - tphase) * w).sum() / w.sum().clamp_min(1e-7)
+    gd = (aw((sphase[:, 1:] - sphase[:, :-1]) - (tphase[:, 1:] - tphase[:, :-1]))
+          * w[:, 1:]).sum() / w[:, 1:].sum().clamp_min(1e-7)
+    return amp, ip + gd
+
+
 def load_encoder(checkpoint_path, device="cpu"):
     """Load the frozen Q2D2 encoder from a checkpoint (Phase 2: → astrape.encoder)."""
     from .encoder import MCSTransQ2D2Config, MCSTransQ2D2
@@ -93,7 +175,8 @@ def parse_args():
     ap.add_argument("--lr-d", type=float, default=2e-4)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num-workers", type=int, default=6)
-    ap.add_argument("--encoder-ckpt", type=Path, required=True)
+    ap.add_argument("--encoder-ckpt", type=Path, default=None,
+                    help="frozen encoder checkpoint (required unless --content-dir is given)")
     ap.add_argument("--out-dir", type=Path,
                     default=Path("/Volumes/UNTITLED/btrv5_checkpoints/decoder_v5"))
     ap.add_argument("--resume", type=Path, default=None)
@@ -101,9 +184,15 @@ def parse_args():
     ap.add_argument("--wavlm-dir", type=str, default="wavlm_L4_200hz")
     ap.add_argument("--wavlm-rate", type=int, default=200,
                     help="WavLM cache rate (must match the encoder; 200 for wavlm_L4_200hz).")
+    ap.add_argument("--content-dir", type=str, default=None,
+                    help="Pre-cached FULL-context content subdir (e.g. content_striding_8l_200hz). "
+                         "Skips the per-step frozen-encoder forward and matches streaming context.")
     # losses / curriculum
     ap.add_argument("--nffts", type=int, nargs="+", default=[512, 1024, 2048])
-    ap.add_argument("--blur-sigma-ms", type=float, default=2.0)
+    ap.add_argument("--blur-sigma-ms", type=float, default=0.0,
+                    help="Time-domain Gaussian blur of the TARGET. KEEP 0: even 2ms is an "
+                         "~80Hz low-pass that strips ~94%% of speech energy → trains the "
+                         "decoder to a near-silent target (the old quiet-output bug).")
     ap.add_argument("--mrstft-weight", type=float, default=1.0)
     ap.add_argument("--mel-l1-weight", type=float, default=1.0)
     ap.add_argument("--adv-weight", type=float, default=1.0)
@@ -113,7 +202,28 @@ def parse_args():
                          "HiFi-GAN-style ~0.37s). Reconstruction still uses full audio. "
                          "Cuts discriminator compute ~5x with no quality loss.")
     ap.add_argument("--use-nsf", action="store_true", help="Enable Phase 2b NSF harmonic source.")
-    ap.add_argument("--n-fft", type=int, default=1512)
+    # ── GAN-free teacher distillation (alternative to the adversarial curriculum) ──
+    ap.add_argument("--teacher-distill", action="store_true",
+                    help="GAN-free: distill the (non-causal) MioCodec teacher decoder's output "
+                         "(correct phase/voicing/harmonics — the ceiling for our content) instead "
+                         "of adversarial training. Loss vs teacher = mrstft+mel (amplitude) + "
+                         "complex-STFT + anti-wrap-phase. No discriminator → ~warmup speed. Fixes "
+                         "the buzz (over-voicing/pitch/noisy-highs) the GAN learns only slowly.")
+    ap.add_argument("--cstft-weight", type=float, default=1.0)
+    ap.add_argument("--phase-weight", type=float, default=0.3)
+    ap.add_argument("--f0-weight", type=float, default=1.0,
+                    help="With --use-nsf + --teacher-distill: supervise the NSF F0 head "
+                         "(log-Hz L1 on voiced frames) against F0 extracted from the teacher. "
+                         "Directly fixes the weak-fundamental / octave-up pitch instability.")
+    ap.add_argument("--voiced-weight", type=float, default=0.5)
+    ap.add_argument("--spec-distill", action="store_true",
+                    help="With --teacher-distill: distill the teacher's iSTFT-head magnitude & "
+                         "phase DIRECTLY (needs v5 on the teacher's 392/98 grid). Loss = "
+                         "amp_weight·log-mag-L1 + specphase_weight·anti-wrap-phase. The crisp "
+                         "8.9ms window + exact teacher phase target fix the fizz.")
+    ap.add_argument("--amp-weight", type=float, default=1.0)
+    ap.add_argument("--specphase-weight", type=float, default=1.0)
+    ap.add_argument("--n-fft", type=int, default=392)
     ap.add_argument("--clip-grad", type=float, default=1.0)
     return ap.parse_args()
 
@@ -147,17 +257,30 @@ def main():
     train_idx = idx[:split]
     train_ds = Phase0Dataset(train_idx, data_dir / args.wavlm_dir, source_files,
                              None, spk_names, args.max_frames, args.seed,
-                             wavlm_rate=args.wavlm_rate, speaker_emb_map=speaker_emb_map)
+                             wavlm_rate=args.wavlm_rate, speaker_emb_map=speaker_emb_map,
+                             content_dir=(data_dir / args.content_dir) if args.content_dir else None)
     train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,
                               num_workers=args.num_workers,
                               persistent_workers=args.num_workers > 0,
                               collate_fn=collate_phase0, drop_last=True)
 
-    # ── encoder (frozen), generator (v5), discriminators ──
-    encoder, _ = load_encoder(args.encoder_ckpt, device)
+    # ── encoder (frozen — only if content isn't pre-cached), generator (v5), discriminators ──
+    if args.content_dir:
+        encoder = None
+        print(f"Using pre-cached full-context content: {args.content_dir}", flush=True)
+    else:
+        if not args.encoder_ckpt:
+            raise SystemExit("--encoder-ckpt is required unless --content-dir is given")
+        encoder, _ = load_encoder(args.encoder_ckpt, device)
     dec_cfg = CausalDecoderV5Config(use_nsf=args.use_nsf, n_fft=args.n_fft)
     decoder = CausalDecoderV5(dec_cfg).to(device)
     disc = CombinedDiscriminator().to(device)
+
+    mio = None
+    if args.teacher_distill:
+        from .miocodec import load_mio
+        mio = load_mio(args.device).eval()
+        print("Teacher distillation (GAN-free): MioCodec decoder output is the target", flush=True)
 
     opt_g = torch.optim.AdamW(decoder.parameters(), lr=args.lr_g, betas=(0.8, 0.99))
     opt_d = torch.optim.AdamW(disc.parameters(), lr=args.lr_d, betas=(0.8, 0.99))
@@ -167,12 +290,31 @@ def main():
     start_epoch = 0
     if args.resume:
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)
-        decoder.load_state_dict(ck["state_dict"], strict=False)
+        # Shape-filtered load so a non-NSF checkpoint can warm-start an --use-nsf model:
+        # the NSF head + widened istft_bridge are re-initialised, everything else transfers.
+        sd = decoder.state_dict()
+        compat = {k: v for k, v in ck["state_dict"].items() if k in sd and sd[k].shape == v.shape}
+        decoder.load_state_dict(compat, strict=False)
+        reinit = [k for k in sd if k not in compat]
+        # Preserve the learned istft_bridge when widening for NSF: copy the old input
+        # channels, zero the new NSF channels → the decoder starts IDENTICAL to the non-NSF
+        # checkpoint (NSF is a no-op), so no spectral quality is lost; the F0 head still gets
+        # direct F0 supervision and the bridge learns to use the comb from zero.
+        bw = ck["state_dict"].get("istft_bridge.weight")
+        if bw is not None and tuple(bw.shape) != tuple(sd["istft_bridge.weight"].shape):
+            with torch.no_grad():
+                decoder.istft_bridge.weight.zero_()
+                decoder.istft_bridge.weight[:, :bw.shape[1]].copy_(bw)
+            print(f"  resume: preserved istft_bridge ({bw.shape[1]} ch copied, NSF ch zeroed)", flush=True)
+        if reinit:
+            print(f"  resume: {len(compat)}/{len(sd)} tensors loaded, {len(reinit)} re-init "
+                  f"(NSF/bridge): {reinit[:3]}", flush=True)
         disc.load_state_dict(ck.get("disc", {}), strict=False)
-        if "opt_g" in ck: opt_g.load_state_dict(ck["opt_g"])
-        if "opt_d" in ck: opt_d.load_state_dict(ck["opt_d"])
-        if "sch_g" in ck: sch_g.load_state_dict(ck["sch_g"])
-        if "sch_d" in ck: sch_d.load_state_dict(ck["sch_d"])
+        if not reinit:                        # same architecture → restore optimiser/schedule
+            if "opt_g" in ck: opt_g.load_state_dict(ck["opt_g"])
+            if "opt_d" in ck: opt_d.load_state_dict(ck["opt_d"])
+            if "sch_g" in ck: sch_g.load_state_dict(ck["sch_g"])
+            if "sch_d" in ck: sch_d.load_state_dict(ck["sch_d"])
         start_epoch = int(ck.get("epoch", -1)) + 1
 
     # CPU: the spectral reconstruction loss is computed on CPU (MPS torch.stft's
@@ -201,55 +343,109 @@ def main():
                 break
             wavlm, audio, speaker = wavlm.to(device), audio.to(device), speaker.to(device)
 
-            with torch.no_grad():
-                mask = torch.ones(wavlm.shape[0], wavlm.shape[1] // 2, dtype=torch.bool, device=device)
-                content = encoder(wavlm.transpose(1, 2), padding_mask=mask)["projected"].transpose(1, 2)
+            if encoder is None:                       # pre-cached full-context content (B, T, 768)
+                content = wavlm
+            else:
+                with torch.no_grad():
+                    mask = torch.ones(wavlm.shape[0], wavlm.shape[1] // 2, dtype=torch.bool, device=device)
+                    content = encoder(wavlm.transpose(1, 2), padding_mask=mask)["projected"].transpose(1, 2)
             stft_len = decoder._compute_stft_length(content.shape[1])
-            pred = decoder(content, speaker, stft_length=stft_len)
+            pred_f0 = pred_voiced = smag = sphase = None
+            if args.spec_distill:
+                pred, smag, sphase = decoder(content, speaker, stft_length=stft_len, return_spec=True)
+            elif args.use_nsf:
+                pred, pred_f0, pred_voiced = decoder(content, speaker, stft_length=stft_len, return_aux=True)
+            else:
+                pred = decoder(content, speaker, stft_length=stft_len)
 
             t_len = min(pred.shape[1], audio.shape[1])
             pred, tgt = pred[:, :t_len], audio[:, :t_len]
-            tgt_blur = gaussian_blur_wave(tgt, args.blur_sigma_ms) if args.blur_sigma_ms > 0 else tgt
-
-            # ── reconstruction (always) — spectral loss computed on CPU ──
-            # MPS torch.stft's BACKWARD intermittently emits non-finite gradients,
-            # which (pre-guard) poisoned the weights → recon=nan, and (post-guard)
-            # showed up as accelerating skipped steps. CPU stft is exact; autograd
-            # flows the grads back to the MPS decoder. The decoder fwd/iSTFT stays on
-            # MPS (verified always finite). Per-step transfer is ~0.7MB → negligible.
-            pred_c, tgt_c = pred.float().cpu(), tgt_blur.float().cpu()
-            recon = (args.mrstft_weight * mrstft(pred_c, tgt_c, args.nffts)
-                     + args.mel_l1_weight * F.l1_loss(
-                         mel_fn(pred_c).clamp_min(1e-5).log(),
-                         mel_fn(tgt_c).clamp_min(1e-5).log())).to(device)
-
-            if adversarial:
-                # Discriminate on a random short window (HiFi-GAN segment style):
-                # same crop for real+fake, full audio still used for reconstruction.
-                # Discriminators are local/shift-invariant → quality-neutral, ~5x cheaper.
-                W = min(args.disc_window, pred.shape[1])
-                st = torch.randint(0, pred.shape[1] - W + 1, (1,)).item()
-                pred_w, tgt_w = pred[:, st:st + W], tgt[:, st:st + W]
-
-                # ── D step ──
-                real_lg, _ = disc(tgt_w)
-                fake_lg, _ = disc(pred_w.detach())
-                d_loss = discriminator_loss(real_lg, fake_lg)
-                opt_d.zero_grad(set_to_none=True)
-                d_loss.backward()
-                dnorm = torch.nn.utils.clip_grad_norm_(disc.parameters(), args.clip_grad)
-                if torch.isfinite(dnorm):
-                    opt_d.step()
-
-                # ── G step ──
-                fake_lg, fake_fm = disc(pred_w)
-                real_lg, real_fm = disc(tgt_w)
-                adv = generator_adv_loss(fake_lg)
-                fm = feature_matching_loss(real_fm, fake_fm)
-                g_loss = args.adv_weight * adv + args.fm_weight * fm + recon
-            else:
+            if args.teacher_distill and args.spec_distill:
+                # ── direct iSTFT-head distillation: match the teacher's predicted mag/phase ──
+                # (the user's "distil the inter-module values" idea, at the one aligned point:
+                # both heads now on the 392/98 grid). On-device, no torch.stft.
+                with torch.no_grad():
+                    tch_len = mio._calculate_target_stft_length(tgt.shape[1])
+                    tmag, tphase = teacher_spec(mio, content, speaker, tch_len)
+                amp, ph = spec_distill_loss(smag, sphase, tmag, tphase)
+                recon = args.amp_weight * amp + args.specphase_weight * ph
+                adv, fm = amp.detach(), ph.detach()          # log slots: adv=amp, fm=phase
+                d_loss = pred.new_zeros(())
+                g_loss = recon
+            elif args.teacher_distill:
+                # ── GAN-free: distill the (non-causal) MioCodec teacher decoder ──
+                # The teacher is the achievable ceiling for OUR content and gets phase /
+                # voicing / harmonics right — matching it directly removes the buzz
+                # (over-voicing, octave-up pitch, noisy highs) the GAN fixes only slowly.
+                with torch.no_grad():
+                    tch_len = mio._calculate_target_stft_length(tgt.shape[1])
+                    teacher = mio.forward_wave(content, speaker, stft_length=tch_len)
+                tl = min(pred.shape[1], teacher.shape[1])
+                pred_c, tgt_c = pred[:, :tl].float().cpu(), teacher[:, :tl].float().cpu()
+                recon = (args.mrstft_weight * mrstft(pred_c, tgt_c, args.nffts)
+                         + args.mel_l1_weight * F.l1_loss(
+                             mel_fn(pred_c).clamp_min(1e-5).log(),
+                             mel_fn(tgt_c).clamp_min(1e-5).log())
+                         + args.cstft_weight * complex_stft_loss(pred_c, tgt_c, args.nffts)
+                         + args.phase_weight * anti_wrap_phase_loss(pred_c, tgt_c)).to(device)
                 adv = fm = d_loss = pred.new_zeros(())
                 g_loss = recon
+                if args.use_nsf and pred_f0 is not None:
+                    # ── explicit F0 supervision: pull the NSF F0 head to the teacher's pitch ──
+                    # (the spectral loss alone leaves the fundamental weak → octave-up jitter).
+                    with torch.no_grad():
+                        tgt_f0, tgt_voiced = extract_f0(tgt_c)            # from teacher waveform
+                    Tf = min(pred_f0.shape[1], tgt_f0.shape[1])
+                    pf, pv = pred_f0[:, :Tf].float().cpu(), pred_voiced[:, :Tf].float().cpu()
+                    tf0, tv = tgt_f0[:, :Tf], tgt_voiced[:, :Tf]
+                    f0_loss = ((pf.clamp_min(1.0).log() - tf0.clamp_min(1.0).log()).abs() * tv
+                               ).sum() / tv.sum().clamp_min(1.0)
+                    voiced_loss = F.binary_cross_entropy(pv.clamp(1e-4, 1 - 1e-4), tv)
+                    g_loss = g_loss + (args.f0_weight * f0_loss
+                                       + args.voiced_weight * voiced_loss).to(device)
+                    adv, fm = f0_loss.detach().to(device), voiced_loss.detach().to(device)  # log slots
+            else:
+                tgt_blur = gaussian_blur_wave(tgt, args.blur_sigma_ms) if args.blur_sigma_ms > 0 else tgt
+
+                # ── reconstruction (always) — spectral loss computed on CPU ──
+                # MPS torch.stft's BACKWARD intermittently emits non-finite gradients,
+                # which (pre-guard) poisoned the weights → recon=nan, and (post-guard)
+                # showed up as accelerating skipped steps. CPU stft is exact; autograd
+                # flows the grads back to the MPS decoder. The decoder fwd/iSTFT stays on
+                # MPS (verified always finite). Per-step transfer is ~0.7MB → negligible.
+                pred_c, tgt_c = pred.float().cpu(), tgt_blur.float().cpu()
+                recon = (args.mrstft_weight * mrstft(pred_c, tgt_c, args.nffts)
+                         + args.mel_l1_weight * F.l1_loss(
+                             mel_fn(pred_c).clamp_min(1e-5).log(),
+                             mel_fn(tgt_c).clamp_min(1e-5).log())).to(device)
+
+                if adversarial:
+                    # Discriminate on a random short window (HiFi-GAN segment style):
+                    # same crop for real+fake, full audio still used for reconstruction.
+                    # Discriminators are local/shift-invariant → quality-neutral, ~5x cheaper.
+                    W = min(args.disc_window, pred.shape[1])
+                    st = torch.randint(0, pred.shape[1] - W + 1, (1,)).item()
+                    pred_w, tgt_w = pred[:, st:st + W], tgt[:, st:st + W]
+
+                    # ── D step ──
+                    real_lg, _ = disc(tgt_w)
+                    fake_lg, _ = disc(pred_w.detach())
+                    d_loss = discriminator_loss(real_lg, fake_lg)
+                    opt_d.zero_grad(set_to_none=True)
+                    d_loss.backward()
+                    dnorm = torch.nn.utils.clip_grad_norm_(disc.parameters(), args.clip_grad)
+                    if torch.isfinite(dnorm):
+                        opt_d.step()
+
+                    # ── G step ──
+                    fake_lg, fake_fm = disc(pred_w)
+                    real_lg, real_fm = disc(tgt_w)
+                    adv = generator_adv_loss(fake_lg)
+                    fm = feature_matching_loss(real_fm, fake_fm)
+                    g_loss = args.adv_weight * adv + args.fm_weight * fm + recon
+                else:
+                    adv = fm = d_loss = pred.new_zeros(())
+                    g_loss = recon
 
             opt_g.zero_grad(set_to_none=True)
             g_loss.backward()
@@ -267,7 +463,7 @@ def main():
 
             if steps % 100 == 0:
                 d = max(steps - skipped, 1)
-                tag = "ADV" if adversarial else "REC"
+                tag = "DST" if args.teacher_distill else ("ADV" if adversarial else "REC")
                 print(f"E{ep:02d}[{tag}] {steps:04d}/{args.steps_per_epoch} "
                       f"recon={acc['recon'].item()/d:.3f} adv={acc['adv'].item()/d:.3f} "
                       f"fm={acc['fm'].item()/d:.3f} d={acc['d'].item()/d:.3f} skip={skipped} "

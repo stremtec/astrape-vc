@@ -18,9 +18,25 @@ import torchaudio
 from torch.utils.data import Dataset
 
 import math
+import time
 from dataclasses import dataclass, field
 
 S = 44100  # decoder / audio sample rate
+
+
+def _io_retry(fn, tries: int = 10, delay: float = 0.5):
+    """Retry a flaky read. The WavLM/content caches AND the VCTK audio live on an external
+    USB drive that occasionally drops an I/O for <1 s — surfacing as FileNotFoundError /
+    OSError (np.load) OR soundfile.LibsndfileError (sf.read), which is NOT an OSError. We
+    catch any read exception and retry; one blip would otherwise kill the whole run.
+    Genuine errors still surface (re-raised after `tries`)."""
+    for k in range(tries):
+        try:
+            return fn()
+        except Exception:
+            if k == tries - 1:
+                raise
+            time.sleep(delay)
 
 
 def gaussian_blur_wave(wave: torch.Tensor, sigma_ms: float = 2.0) -> torch.Tensor:
@@ -47,9 +63,17 @@ class Phase0Dataset(Dataset):
 
     def __init__(self, indices, wavlm_dir, source_files, spk_embeds,
                  spk_names, max_content_frames=50, seed=42, wavlm_rate=50,
-                 speaker_emb_map=None):
+                 speaker_emb_map=None, content_dir=None, load_audio=True):
         self.indices = [int(i) for i in indices]
+        # load_audio=False: skip the original-audio read (only its LENGTH is needed for
+        # teacher-distillation targets) → training depends ONLY on the local content cache,
+        # surviving the flaky external audio drive disconnecting mid-run.
+        self.load_audio = load_audio
         self.wavlm_dir = Path(wavlm_dir)
+        # If set, load pre-cached FULL-context content (Tc,768) and crop content windows
+        # — the decoder then sees the same context as streaming inference, and the frozen
+        # encoder is not re-run every step.  Else load WavLM (encoded in the train loop).
+        self.content_dir = Path(content_dir) if content_dir else None
         self.source_files = source_files
         self.spk_names = spk_names       # (N,) array of speaker IDs (e.g., 'p315')
         self.spk_embeds = spk_embeds     # (N_spk, 128) float32 tensor (legacy path)
@@ -84,26 +108,38 @@ class Phase0Dataset(Dataset):
         import soundfile as sf
         idx = self.indices[i]
 
-        # ── WavLM features ──
-        wl_path = self.wavlm_dir / f"s_{idx:05d}.npy"
-        wavlm = np.load(wl_path, allow_pickle=False).astype(np.float32)  # (T, 512)
-        wavlm = torch.from_numpy(wavlm)
-
-        # Crop content-aligned: 1 content frame = R wavlm frames = 1764 audio samples
-        # (keeps wavlm and audio integer-aligned for any rate, incl. 200Hz where a
-        # single wavlm frame is a non-integer 220.5 audio samples).
-        avail_cf = wavlm.shape[0] // self.R
-        if avail_cf < self.max_cf:
-            wavlm = F.pad(wavlm, (0, 0, 0, self.max_wavlm - wavlm.shape[0]))
-            cf_start = 0
+        # ── features: pre-cached full-context content, or raw WavLM ──
+        # Crop content-aligned: 1 content frame = R wavlm frames = 1764 audio samples.
+        if self.content_dir is not None:
+            feat = torch.from_numpy(_io_retry(
+                lambda: np.load(self.content_dir / f"s_{idx:05d}.npy", allow_pickle=False).astype(np.float32)))  # (Tc,768)
+            avail_cf = feat.shape[0]
+            if avail_cf < self.max_cf:
+                feat = F.pad(feat, (0, 0, 0, self.max_cf - feat.shape[0])); cf_start = 0
+            else:
+                cf_start = self.rng.randint(0, avail_cf - self.max_cf)
+                feat = feat[cf_start:cf_start + self.max_cf]
         else:
-            cf_start = self.rng.randint(0, avail_cf - self.max_cf)
-            ws = cf_start * self.R
-            wavlm = wavlm[ws:ws + self.max_wavlm]
+            feat = torch.from_numpy(_io_retry(
+                lambda: np.load(self.wavlm_dir / f"s_{idx:05d}.npy", allow_pickle=False).astype(np.float32)))  # (T,512)
+            avail_cf = feat.shape[0] // self.R
+            if avail_cf < self.max_cf:
+                feat = F.pad(feat, (0, 0, 0, self.max_wavlm - feat.shape[0])); cf_start = 0
+            else:
+                cf_start = self.rng.randint(0, avail_cf - self.max_cf)
+                feat = feat[cf_start * self.R: cf_start * self.R + self.max_wavlm]
 
-        # ── Original audio ──
+        # ── Original audio (skippable — only the length matters for distillation) ──
+        if not self.load_audio:
+            wave = torch.zeros(self.max_samples)
+            spk_id = str(self.spk_names[idx])
+            if self.speaker_emb_map is not None:
+                spk = self.speaker_emb_map.get(spk_id, self._spk_fallback).clone()
+            else:
+                spk = self.spk_embeds[self.spk_to_emb.get(spk_id, 0)].clone()
+            return {"wavlm": feat, "audio": wave, "speaker": spk, "index": idx}
         src_path = str(self.source_files[idx])
-        wave, sr = sf.read(src_path, dtype="float32")
+        wave, sr = _io_retry(lambda: sf.read(src_path, dtype="float32"))
         wave = torch.from_numpy(np.asarray(wave))
         if wave.ndim == 2:
             wave = wave.mean(1)
@@ -130,7 +166,7 @@ class Phase0Dataset(Dataset):
             spk_idx = self.spk_to_emb.get(spk_id, 0)  # fallback to first
             spk = self.spk_embeds[spk_idx].clone()
 
-        return {"wavlm": wavlm, "audio": wave, "speaker": spk, "idx": idx}
+        return {"wavlm": feat, "audio": wave, "speaker": spk, "idx": idx}
 
 
 def collate_phase0(batch):

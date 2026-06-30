@@ -588,6 +588,11 @@ def main() -> None:
         frac = min(1.0, epoch / max(1, E - 1))
         return start + (end - start) * frac
 
+    # ── trend tracker ──
+    prev_cos768 = -1.0
+    prev_usage = 0.0
+    total_steps_all = max(1, args.steps_per_epoch) * max(1, args.epochs - start_epoch)
+
     for epoch in range(start_epoch, args.epochs):
         # ── Gumbel temperature annealing ──
         tau = _gumbel_temp(epoch)
@@ -674,19 +679,40 @@ def main() -> None:
             if step % args.log_every == 0 or step == args.steps_per_epoch:
                 s = max(step, 1)
                 elapsed = time.time() - step_started
-                # Progress bar + ETA
+                # Progress + trend + ETA
                 pct = step * 100 // args.steps_per_epoch
                 bar = '\u2588' * (pct // 5) + '\u2591' * (20 - pct // 5)
-                total_epochs = max(1, args.epochs - start_epoch)
-                total_steps = total_epochs * args.steps_per_epoch
                 steps_done = (epoch - start_epoch) * args.steps_per_epoch + step
                 sps = elapsed / s
-                eta_h = sps * (total_steps - steps_done) / 3600
+                eta_h = sps * (total_steps_all - steps_done) / 3600
+
+                # Trend: cos↑ or ↓, usage state
+                avg_cos = totals['cos768'] / s
+                avg_use = totals.get('q2d2_usage', 0) / s
+                if prev_cos768 > 0:
+                    d_cos = avg_cos - prev_cos768
+                    if d_cos > 0.001:
+                        trend_cos = '\u2191'  # ↑ increasing
+                    elif d_cos < -0.001:
+                        trend_cos = '\u2193'  # ↓ decreasing
+                    else:
+                        trend_cos = '\u2192'  # → plateau
+                    d_use = avg_use - prev_usage
+                    if avg_use < prev_usage - 0.005:
+                        phase = '\u2699'  # ⚙ compression
+                    elif avg_use > prev_usage + 0.005:
+                        phase = '\u2b06'  # ⬆ expansion
+                    else:
+                        phase = '\u2194'  # ↔ stable
+                else:
+                    trend_cos, phase = '\u00b7', '\u00b7'  # · unknown
+                prev_cos768, prev_usage = avg_cos, avg_use
+
                 print(
                     f"E{epoch:03d} [{bar}] {pct:3d}% "
-                    f"| loss={totals['loss']/s:.4f} cos={totals['cos768']/s:.4f} "
+                    f"| loss={totals['loss']/s:.4f} cos={avg_cos:.4f} {trend_cos} "
                     f"l1={totals.get('content_l1',0)/s:.4f} "
-                    f"use={totals.get('q2d2_usage',0)/s:.3f} "
+                    f"use={avg_use:.3f} {phase} "
                     f"| {sps:.2f}s | ETA {eta_h:.1f}h",
                     flush=True,
                 )

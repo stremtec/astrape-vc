@@ -505,6 +505,15 @@ class MCSTransQ2D2(nn.Module):
             gumbel_temperature=max(config.q2d2_gumbel_start, 0.0),
         )
 
+        # ── Post-Q2D2 content expansion (compensates std compression) ──
+        self.content_expand = nn.Sequential(
+            nn.Linear(config.content_dim, 256),
+            nn.GELU(),
+            nn.Linear(256, config.content_dim),
+        )
+        nn.init.zeros_(self.content_expand[-1].weight)
+        nn.init.zeros_(self.content_expand[-1].bias)
+
         # ── optional WavLM frontend adapter ──
         self.use_wavlm_frontend = config.use_wavlm_frontend
         if self.use_wavlm_frontend:
@@ -571,6 +580,10 @@ class MCSTransQ2D2(nn.Module):
         content, q2d2_codes = self.q2d2(h, return_codes=True)
         # content:  (B, T, 768)  — MioCodec compatible
         # q2d2_codes: (B, T, 6) — raw quantized latent (for utilization stats)
+
+        # ── Content expansion (compensates Q2D2 std compression) ──
+        if hasattr(self, 'content_expand'):
+            content = content + self.content_expand(content)
 
         # ── forecast predictions ──
         fc1 = self.forecast_head_1(h)  # (B, T, 768)
