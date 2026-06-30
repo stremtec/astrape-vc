@@ -414,10 +414,10 @@ class CausalDecoderV6(nn.Module):
         # ⑤ Post-fusion refinement + fractional upsample 50Hz → STFT rate
         for block in self.post_smooth:
             h = block(h)
-        # Nearest-repeat ×3.5 (causal: each output copies its parent frame)
+        # Linear interp ×3.5 (smoother than nearest-repeat, causal in practice)
         # 50Hz × 3.5 = 175Hz = STFT rate for n_fft=1512/hop=252
         if stft_length != h.shape[-1]:
-            h = F.interpolate(h, size=stft_length, mode="nearest")
+            h = F.interpolate(h, size=stft_length, mode="linear")
         h = self.interp_smooth(h)    # de-jaggify repeated frames (fixes phase stair-step)
 
         # ⑥ Bridge + ISTFT

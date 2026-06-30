@@ -21,7 +21,7 @@ import torchaudio
 from torch.utils.data import DataLoader
 
 from .data import Phase0Dataset, collate_phase0
-from .train_decoder import mrstft, complex_stft_loss
+from .train_decoder import mrstft, complex_stft_loss, anti_wrap_phase_loss
 from .decoder_v6 import CausalDecoderV6, CausalDecoderV6Config
 
 S = 44100
@@ -45,7 +45,10 @@ def main():
     ap.add_argument("--resume", type=Path, default=None)
     ap.add_argument("--nffts", type=int, nargs="+", default=[512, 1024, 2048])
     ap.add_argument("--mel-weight", type=float, default=1.0)
-    ap.add_argument("--cstft-weight", type=float, default=0.05)
+    ap.add_argument("--cstft-weight", type=float, default=0.3,
+                    help="Weight on complex-STFT loss (real+imag L1). 0.01=ignore phase, 1.0=phase equally important.")
+    ap.add_argument("--phase-weight", type=float, default=0.1,
+                    help="Weight on anti-wrap phase loss (IP+GD). 0=disabled. Directly supervises phase smoothness.")
     ap.add_argument("--clip-grad", type=float, default=1.0)
     # v6 architecture overrides
     ap.add_argument("--fusion-layers", type=int, default=4,
@@ -91,7 +94,7 @@ def main():
     algo = (dec_cfg.n_fft - dec_cfg.hop_length) / 2 / S * 1000
     print(f"CausalDecoderV6: {dec_params/1e6:.2f}M  fusion={dec_cfg.fusion_layers}L  "
           f"algo-latency={algo:.1f}ms  "
-          f"(output distill: MR-STFT + {args.mel_weight}*Mel-L1 + {args.cstft_weight}*cSTFT)", flush=True)
+          f"(MR-STFT + {args.mel_weight}*Mel + {args.cstft_weight}*cSTFT + {args.phase_weight}*Phase)", flush=True)
 
     t0 = time.time()
     for ep in range(start, args.epochs):
@@ -101,7 +104,7 @@ def main():
             for pg in opt.param_groups:
                 pg['lr'] = args.lr * (ep + 1) / args.warmup_epochs
 
-        acc = {k: torch.zeros((), device=device) for k in ("stft", "mel", "cstft")}
+        acc = {k: torch.zeros((), device=device) for k in ("stft", "mel", "cstft", "phase")}
         steps = skipped = 0
         for content, audio, speaker, _i in loader:
             steps += 1
@@ -117,14 +120,16 @@ def main():
             stft_l = mrstft(pc, tc, args.nffts)
             mel_l = F.l1_loss(mel_fn(pc).clamp_min(1e-5).log(), mel_fn(tc).clamp_min(1e-5).log())
             cstft_l = complex_stft_loss(pc, tc, args.nffts)
-            loss = (stft_l + args.mel_weight * mel_l + args.cstft_weight * cstft_l).to(device)
+            phase_l = anti_wrap_phase_loss(pc, tc) if args.phase_weight > 0 else pc.new_zeros(())
+            loss = (stft_l + args.mel_weight * mel_l + args.cstft_weight * cstft_l
+                    + args.phase_weight * phase_l).to(device)
             opt.zero_grad(set_to_none=True); loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(dec.parameters(), args.clip_grad)
             if not torch.isfinite(gn):
                 opt.zero_grad(set_to_none=True); skipped += 1; continue
             opt.step()
             acc["stft"] += stft_l.detach().to(device); acc["mel"] += mel_l.detach().to(device)
-            acc["cstft"] += cstft_l.detach().to(device)
+            acc["cstft"] += cstft_l.detach().to(device); acc["phase"] += phase_l.detach().to(device)
             if steps % 100 == 0:
                 d = max(steps - skipped, 1)
                 pct = steps * 100 // args.steps_per_epoch
@@ -132,7 +137,7 @@ def main():
                 s_per = elapsed / ((ep - start) * args.steps_per_epoch + steps)
                 print(f"E{ep:02d} [{pct:3d}%] stft={acc['stft'].item()/d:.3f} "
                       f"mel={acc['mel'].item()/d:.3f} cstft={acc['cstft'].item()/d:.3f} "
-                      f"skip={skipped} {s_per:.2f}s/step", flush=True)
+                      f"ph={acc['phase'].item()/d:.3f} skip={skipped} {s_per:.2f}s/step", flush=True)
         sch.step()
         ckpt = {"state_dict": dec.state_dict(), "opt": opt.state_dict(), "sch": sch.state_dict(),
                 "decoder_config": dec_cfg.__dict__, "epoch": ep}
