@@ -53,6 +53,9 @@ jobs:
           uv run python3 << 'PYEOF'
           import sys, importlib, pathlib, traceback
 
+          # External MioCodec needed by absolute miocodec imports
+          sys.path.insert(0, str(pathlib.Path("external/MioCodec/src").resolve()))
+
           pkg = pathlib.Path('astrape')
           ok = 0
           fail = 0
