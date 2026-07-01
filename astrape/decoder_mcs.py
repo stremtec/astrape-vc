@@ -70,6 +70,22 @@ class UpsampleStage(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Multi-band partition
+# ═══════════════════════════════════════════════════════════════════
+
+def _make_bands(n_fft: int):
+    """Partition frequency bins into bands. Fewer bins per band = easier phase pred."""
+    n_freq = n_fft // 2 + 1  # 197 for n_fft=392
+    # Low freqs: finer bands (more perceptual importance, harmonic structure)
+    # High freqs: wider bands (less critical, more noise-like)
+    if n_freq >= 197:
+        cuts = [0, 32, 64, 128, n_freq]  # 4 bands: 32, 32, 64, 69 bins
+    else:
+        cuts = [0, n_freq // 3, 2 * n_freq // 3, n_freq]
+    return [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Config
 # ═══════════════════════════════════════════════════════════════════
 
@@ -153,8 +169,12 @@ class CausalDecoderMCS(nn.Module):
         for f in c.upsampler_factors:
             self.upsampler.append(UpsampleStage(cur, cur, factor=f))
 
-        # ⑥ ISTFT head: single Linear → mag+phase → iSTFT
-        self.istft_out = nn.Linear(W, c.n_fft + 2)
+        # ⑥ ISTFT head: multi-band Linear → mag+phase → iSTFT
+        self.bands = _make_bands(c.n_fft)  # [(start, end), ...] band partitions
+        self.band_heads = nn.ModuleList([
+            nn.Linear(W, (end - start) * 2)  # *2 for mag_log+phase
+            for start, end in self.bands
+        ])
         from miocodec.module.istft_head import ISTFT
         self.istft = ISTFT(n_fft=c.n_fft, hop_length=c.hop_length,
                            win_length=c.n_fft, padding=c.istft_padding)
@@ -193,10 +213,16 @@ class CausalDecoderMCS(nn.Module):
             cur_len *= block.tr.stride[0]
             h = block(h, out_len=cur_len)
 
-        # ⑥ ISTFT head: Linear → mag+phase → iSTFT
+        # ⑥ ISTFT head: multi-band Linear → mag+phase → iSTFT
         h = h.transpose(1, 2)                            # (B, T_stft, 512)
-        xo = self.istft_out(h).transpose(1, 2)           # (B, n_fft+2, T_stft)
-        mag_log, phase = xo.chunk(2, dim=1)
+        # Predict each band independently, then concatenate along freq axis
+        mag_logs, phases = [], []
+        for head, (start, end) in zip(self.band_heads, self.bands):
+            xo = head(h).transpose(1, 2)                 # (B, (end-start)*2, T_stft)
+            ml, ph = xo.chunk(2, dim=1)                  # (B, end-start, T_stft) each
+            mag_logs.append(ml); phases.append(ph)
+        mag_log = torch.cat(mag_logs, dim=1)              # (B, 197, T_stft)
+        phase = torch.cat(phases, dim=1)
         mag = torch.exp(mag_log).clamp(max=1e2)
         wav = self.istft(torch.complex(mag * torch.cos(phase), mag * torch.sin(phase)))
         if return_spec:
