@@ -169,15 +169,8 @@ class CausalDecoderMCS(nn.Module):
         for f in c.upsampler_factors:
             self.upsampler.append(UpsampleStage(cur, cur, factor=f))
 
-        # ⑥ ISTFT head: multi-band Linear → mag+phase → iSTFT
-        self.bands = _make_bands(c.n_fft)  # [(start, end), ...] band partitions
-        self.band_heads = nn.ModuleList([
-            nn.Linear(W, (end - start) * 2)  # *2 for mag_log+phase
-            for start, end in self.bands
-        ])
-        # Frequency-axis depthwise conv: smooths band boundaries, shares phase info
-        n_freq = c.n_fft // 2 + 1
-        self.freq_smooth = CausalConv1d(2, 2, 5, groups=2)  # 2 channels = mag_log+phase
+        # ⑥ ISTFT head: single Linear → mag+phase → iSTFT
+        self.istft_out = nn.Linear(W, c.n_fft + 2)
         from miocodec.module.istft_head import ISTFT
         self.istft = ISTFT(n_fft=c.n_fft, hop_length=c.hop_length,
                            win_length=c.n_fft, padding=c.istft_padding)
@@ -216,23 +209,10 @@ class CausalDecoderMCS(nn.Module):
             cur_len *= block.tr.stride[0]
             h = block(h, out_len=cur_len)
 
-        # ⑥ ISTFT head: multi-band Linear → mag+phase → iSTFT
+        # ⑥ ISTFT head: Linear → mag+phase → iSTFT
         h = h.transpose(1, 2)                            # (B, T_stft, 512)
-        # Predict each band independently, then concatenate along freq axis
-        mag_logs, phases = [], []
-        for head, (start, end) in zip(self.band_heads, self.bands):
-            xo = head(h).transpose(1, 2)                 # (B, (end-start)*2, T_stft)
-            ml, ph = xo.chunk(2, dim=1)                  # (B, end-start, T_stft) each
-            mag_logs.append(ml); phases.append(ph)
-        mag_log = torch.cat(mag_logs, dim=1)              # (B, 197, T_stft)
-        phase = torch.cat(phases, dim=1)
-        # Frequency-axis smooth: stack mag+phase → conv → split
-        mp = torch.stack([mag_log, phase], dim=1)          # (B, 2, 197, T_stft)
-        B_s, _, nf_s, T_s = mp.shape
-        mp = mp.reshape(B_s * T_s, 2, nf_s)                # (B*T, 2, 197)
-        mp = self.freq_smooth(mp)                           # depthwise along freq
-        mp = mp.reshape(B_s, 2, nf_s, T_s)
-        mag_log, phase = mp[:, 0], mp[:, 1]
+        xo = self.istft_out(h).transpose(1, 2)           # (B, n_fft+2, T_stft)
+        mag_log, phase = xo.chunk(2, dim=1)
         mag = torch.exp(mag_log).clamp(max=1e2)
         wav = self.istft(torch.complex(mag * torch.cos(phase), mag * torch.sin(phase)))
         if return_spec:
