@@ -60,8 +60,11 @@ def anti_wrap_phase(pred_phase, tgt_phase, mag_weight):
 
 @torch.no_grad()
 def eval_cos(dec, mio, loader, device, num_batches=10):
-    """Waveform cosine vs teacher."""
-    wave_cos_all = []
+    """Waveform + mel-spectrogram cosine vs teacher."""
+    import torchaudio
+    mel_fn = torchaudio.transforms.MelSpectrogram(
+        44100, n_fft=2048, hop_length=512, n_mels=80, f_min=0, f_max=22050, power=1)
+    wave_cos_all, mel_cos_all = [], []
     for i, (content, audio, speaker, _) in enumerate(loader):
         if i >= num_batches: break
         content, audio, speaker = content.to(device), audio.to(device), speaker.to(device)
@@ -69,9 +72,12 @@ def eval_cos(dec, mio, loader, device, num_batches=10):
         teacher = mio.forward_wave(content, speaker, stft_length=tch_len)
         pred = dec(content, speaker)
         tl = min(pred.shape[1], teacher.shape[1])
-        p, t = pred[0, :tl].float(), teacher[0, :tl].float()
+        p, t = pred[0, :tl].cpu(), teacher[0, :tl].cpu()
         wave_cos_all.append(F.cosine_similarity(p, t, dim=0).item())
-    return float(np.mean(wave_cos_all))
+        # Mel cosine
+        pm = mel_fn(p).flatten(); tm = mel_fn(t).flatten()
+        mel_cos_all.append(F.cosine_similarity(pm, tm, dim=0).item())
+    return float(np.mean(wave_cos_all)), float(np.mean(mel_cos_all))
 
 
 def main():
@@ -194,10 +200,10 @@ def main():
 
         # Eval
         dec.eval()
-        wave_cos = eval_cos(dec, mio, loader, device)
-        print(f"E{ep:02d} done  wave_cos={wave_cos:.4f}", flush=True)
+        wave_cos, mel_cos = eval_cos(dec, mio, loader, device)
+        print(f"E{ep:02d} done  wave_cos={wave_cos:.4f}  mel_cos={mel_cos:.4f}", flush=True)
         (args.out_dir / "eval.json").write_text(json.dumps(
-            {"epoch": ep, "wave_cos": wave_cos}, indent=2) + "\n")
+            {"epoch": ep, "wave_cos": wave_cos, "mel_cos": mel_cos}, indent=2) + "\n")
 
     print(f"Done. {time.time()-t0:.0f}s", flush=True)
 
