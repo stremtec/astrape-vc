@@ -389,15 +389,7 @@ class CausalDecoderV6(nn.Module):
             use_rope=True, rope_theta=10000.0, dropout=c.prenet_dropout,
             use_flash_attention=False)
 
-        # ② Prosody LSTM: causal RNN fuses prenet-interpreted content+speaker
-        self.prosody = ProsodyLSTM(
-            content_dim=D,   # prenet output dim (384), not raw 768
-            speaker_dim=c.speaker_dim,
-            hidden=c.prosody_hidden,
-            cond_dim=c.prosody_cond_dim,
-        )
-
-        # ③ Content smoothing @25Hz (ConvNeXt-v2 — proven reliable)
+        # ③ Content smoothing @25Hz (ConvNeXt — proven reliable)
         self.smooth = nn.ModuleList([
             CausalConvNeXtBlock(D, kernel=c.smooth_kernel) for _ in range(c.smooth_blocks)
         ])
@@ -406,16 +398,12 @@ class CausalDecoderV6(nn.Module):
         # ③ AA rate ×2 upsample, 384→512 → 50Hz
         self.up2 = AAUpStage(D, W, factor=2, conv_k=15)
 
-        # ④ Speaker-Content Fusion @50Hz
-        #    Two parallel pathways, then merge:
-
-        #    Path A: AdaLN causal transformer (global prosodic structure)
-        #    The prosody LSTM output conditions this — it carries the accumulated
-        #    pitch/energy context that the teacher's bidirectional prenet provided.
+        # ④ Speaker-Content Fusion @50Hz — AdaLN-Zero with raw speaker embedding
+        #    (no LSTM intermediary; speaker is injected directly, mirroring teacher)
         self.fusion_rope = RoPE(W // c.fusion_heads, max_len=c.fusion_window * 4,
                                 theta=c.fusion_rope_theta)
         self.fusion_layers = nn.ModuleList([
-            AdaLNTransformerLayer(W, c.fusion_heads, c.prosody_cond_dim,
+            AdaLNTransformerLayer(W, c.fusion_heads, c.speaker_dim,  # conditioned by speaker, not LSTM
                                   ff_mult=4)
             for _ in range(c.fusion_layers)
         ])
@@ -475,10 +463,6 @@ class CausalDecoderV6(nn.Module):
         # ① Content prenet: causal transformer interprets @25Hz (mirrors teacher wave_prenet)
         h = self.prenet(h)                               # (B, T, 384)
 
-        # ② Prosody embedding: LSTM reads PRENET-interpreted content+speaker
-        #    (richer representation than raw scaled content)
-        prosody_cond = self.prosody(h, speaker)          # (B, T, prosody_cond_dim)
-
         # ③ Content smoothing @25Hz
         h = h.transpose(1, 2)                            # (B, 384, T)
         for block in self.smooth:
@@ -488,17 +472,12 @@ class CausalDecoderV6(nn.Module):
         # ③ AA rate ×2 → 50Hz
         h = self.up2(h)                                  # (B, 512, 2T)
 
-        # ④ Speaker-Content Fusion @50Hz
-        #    Upsample prosody condition to 50Hz to match
-        T_50 = h.shape[-1]
-        # Nearest-repeat is causal (each 50Hz frame copies its 25Hz parent)
-        prosody_50 = prosody_cond.repeat_interleave(2, dim=1)[:, :T_50, :]  # (B, 2T, cond)
-
-        #    Path A: AdaLN transformer (global)
-        h_a = h.transpose(1, 2)                          # (B, 2T, 512)
+        # ④ Speaker-Content Fusion @50Hz — speaker embedding directly via AdaLN-Zero
+        spk = speaker.unsqueeze(1)                       # (B, 1, 128)
+        h = h.transpose(1, 2)                            # (B, 2T, 512)
         for layer in self.fusion_layers:
-            h_a = layer(h_a, prosody_50, self.fusion_rope, self.config.fusion_window)
-        h = self.fusion_norm(h_a).transpose(1, 2)       # (B, 512, 2T)
+            h = layer(h, spk, self.fusion_rope, self.config.fusion_window)
+        h = self.fusion_norm(h).transpose(1, 2)          # (B, 512, 2T)
 
         # ⑤ Post-fusion refinement + AA upsample 50Hz → 450Hz
         for block in self.post_smooth:
