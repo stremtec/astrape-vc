@@ -1,5 +1,6 @@
 # Data
 data
+data_local/
 wavlm_*/
 checkpoints/
 *.pt

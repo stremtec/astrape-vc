@@ -19,18 +19,24 @@ wn = nn.utils.parametrizations.weight_norm
 
 
 class PeriodDiscriminator(nn.Module):
-    """Reshape 1D audio to (T/p, p) and run 2D convs — captures periodic structure."""
+    """Reshape 1D audio to (T/p, p) and run 2D convs — captures periodic structure.
 
-    def __init__(self, period: int, kernel: int = 5, stride: int = 3):
+    ``channels`` defaults to the HiFi-GAN widths; VocoderDiscriminator passes a leaner
+    stack (the full widths are ~240ms/forward on MPS — too slow for per-step GAN training).
+    """
+
+    def __init__(self, period: int, kernel: int = 5, stride: int = 3,
+                 channels: tuple[int, ...] = (1, 32, 128, 512, 1024)):
         super().__init__()
         self.period = period
         pad = (kernel - 1) // 2
-        ch = [1, 32, 128, 512, 1024]
+        ch = channels
+        top = ch[-1]
         self.convs = nn.ModuleList([
             wn(nn.Conv2d(ch[i], ch[i + 1], (kernel, 1), (stride, 1), (pad, 0)))
-            for i in range(4)
-        ] + [wn(nn.Conv2d(1024, 1024, (kernel, 1), 1, (pad, 0)))])
-        self.post = wn(nn.Conv2d(1024, 1, (3, 1), 1, (1, 0)))
+            for i in range(len(ch) - 1)
+        ] + [wn(nn.Conv2d(top, top, (kernel, 1), 1, (pad, 0)))])
+        self.post = wn(nn.Conv2d(top, 1, (3, 1), 1, (1, 0)))
 
     def forward(self, x: torch.Tensor):
         b, t = x.shape
@@ -96,6 +102,79 @@ class CombinedDiscriminator(nn.Module):
             logits.append(lg)
             fmaps.append(fm)
         return logits, fmaps
+
+
+# ── Multi-Resolution spectrogram Discriminator (UnivNet/BigVGAN) ──────
+
+class SpecDiscriminator(nn.Module):
+    """2D conv discriminator over log|STFT| at one resolution.
+
+    Stride-(2,2) convs shrink both freq and time fast (the spectrogram is large:
+    ~1025×33 at n_fft=2048), so this stays MPS-cheap.  torch.stft runs on x's device —
+    stable on the current MPS torch build (verified fwd==CPU 1e-5, finite backward), with
+    the finite-grad skip guard as backstop.
+    """
+
+    def __init__(self, n_fft: int, hop: int, channels: tuple[int, ...] = (1, 16, 32, 64, 64)):
+        super().__init__()
+        self.n_fft, self.hop = n_fft, hop
+        self.register_buffer("window", torch.hann_window(n_fft))
+        ch = channels
+        self.convs = nn.ModuleList([
+            wn(nn.Conv2d(ch[i], ch[i + 1], (3, 3), (2, 2), (1, 1)))
+            for i in range(len(ch) - 1)
+        ])
+        self.post = wn(nn.Conv2d(ch[-1], 1, (3, 3), 1, (1, 1)))
+
+    def forward(self, x: torch.Tensor):
+        spec = torch.stft(x, self.n_fft, self.hop, self.n_fft, self.window.to(x.device),
+                          center=True, return_complex=True).abs()
+        h = torch.log(spec.clamp_min(1e-5)).unsqueeze(1)       # (B,1,F,T)
+        fmap = []
+        for c in self.convs:
+            h = F.leaky_relu(c(h), 0.1)
+            fmap.append(h)
+        h = self.post(h)
+        fmap.append(h)
+        return h.flatten(1), fmap
+
+
+class MultiResolutionDiscriminator(nn.Module):
+    """3 spectrogram discriminators at (512,128),(1024,256),(2048,512)."""
+
+    def __init__(self, resolutions=((512, 128), (1024, 256), (2048, 512))):
+        super().__init__()
+        self.discs = nn.ModuleList([SpecDiscriminator(n, h) for n, h in resolutions])
+
+    def forward(self, x: torch.Tensor):
+        logits, fmaps = [], []
+        for d in self.discs:
+            lg, fm = d(x)
+            logits.append(lg)
+            fmaps.append(fm)
+        return logits, fmaps
+
+
+class VocoderDiscriminator(nn.Module):
+    """Stage-B discriminator bank: lean MPD (time) + lean MRD (spectral), all on-device.
+
+    Both run on MPS (stft verified stable on the current torch build); the lean channel
+    widths + stride-2 spectral convs keep a full forward ~cheap enough for per-step GAN.
+    """
+
+    def __init__(self, mpd_channels: tuple[int, ...] = (1, 16, 64, 128, 128)):
+        super().__init__()
+        self.mpd = nn.ModuleList([PeriodDiscriminator(p, channels=mpd_channels)
+                                  for p in (2, 3, 5, 7, 11)])
+        self.mrd = MultiResolutionDiscriminator()
+
+    def forward(self, x: torch.Tensor):
+        logits, fmaps = [], []
+        for d in self.mpd:
+            lg, fm = d(x)
+            logits.append(lg); fmaps.append(fm)
+        lg_m, fm_m = self.mrd(x)
+        return logits + lg_m, fmaps + fm_m
 
 
 # ── LSGAN losses ──────────────────────────────────────────────────

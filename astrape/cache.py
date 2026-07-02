@@ -133,9 +133,47 @@ def cache_content(args):
     print(f"Done: {done} content files cached in {out_dir}", flush=True)
 
 
+def cache_acoustics(args):
+    """Ground-truth acoustic targets @150Hz per clip (Stage-A regression target / Stage-B
+    conditioning): mel80 + logF0 + voicing + energy, LEFT-ALIGNED causal framing. Aligned to
+    the content grid: audio is padded/cropped to Tc*1764 so T_acoustic = Tc*6 exactly."""
+    from .acoustics import extract_acoustics, melscale_fbanks, CONTENT_HOP
+    data_dir = Path(args.data_dir)
+    meta = np.load(data_dir / "meta.npz", allow_pickle=False)
+    n = int(meta["n_samples"]); srcs = meta["source_files"][:n].astype(str)
+    end = n if args.limit == 0 else min(n, args.start + args.limit)
+    content_dir = data_dir / args.content_dir     # to read Tc (content length) per clip
+    out_dir = Path(args.out_dir) if args.out_dir else data_dir / "acoustics_150hz"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fb = melscale_fbanks()
+    print(f"Caching acoustics (150Hz, causal) → {out_dir}: {args.start}..{end-1}", flush=True)
+    done = 0
+    for i in range(args.start, end):
+        out_path = out_dir / f"s_{i:05d}.npz"
+        if out_path.exists():
+            continue
+        cpath = content_dir / f"s_{i:05d}.npy"
+        if not cpath.exists():
+            continue
+        Tc = int(np.load(cpath, allow_pickle=False).shape[0])
+        wav = load_wave(Path(str(srcs[i])), SAMPLE_RATE, max_seconds=args.max_s)
+        L = Tc * CONTENT_HOP
+        wav = F.pad(wav, (0, L - wav.shape[0]))[:L] if wav.shape[0] < L else wav[:L]
+        a = extract_acoustics(wav, fb)
+        np.savez(out_path,
+                 mel=a["mel"].numpy().astype(np.float16),
+                 logf0=a["logf0"].numpy().astype(np.float16),
+                 voiced=a["voiced"].numpy().astype(np.float16),
+                 energy=a["energy"].numpy().astype(np.float16))
+        done += 1
+        if done % 500 == 0:
+            print(f"  {done}/{end - args.start}", flush=True)
+    print(f"Done: {done} acoustic files cached in {out_dir}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--what", choices=["wavlm", "speakers", "content"], required=True)
+    ap.add_argument("--what", choices=["wavlm", "speakers", "content", "acoustics"], required=True)
     ap.add_argument("--data-dir", default="data/mio_vctk_full_compact")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out-dir", default=None)
@@ -150,7 +188,8 @@ def main():
     # speakers
     ap.add_argument("--utts-per-speaker", type=int, default=8)
     args = ap.parse_args()
-    {"wavlm": cache_wavlm, "speakers": cache_speakers, "content": cache_content}[args.what](args)
+    {"wavlm": cache_wavlm, "speakers": cache_speakers, "content": cache_content,
+     "acoustics": cache_acoustics}[args.what](args)
 
 
 if __name__ == "__main__":
