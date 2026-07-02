@@ -28,22 +28,22 @@ because bidirectional = no real-time streaming possible).
 
 ---
 
-## 2. Our Encoder (Q2D2, Causal)
+## 2. Our Encoder — StridingAdapter + Q2D2 (Causal)
 
 ```
-WavLM L4 CNN (200Hz, 5 causal convs @16kHz, 10ms delay)  →  cached as (T,512)
-  → WavLMFrontendAdapter:       CausalConv1d k4 s4 (200→50Hz) + Linear(512→80)
-  → Conv stem:                  depthwise dilated CausalConv ×8 + skip connections
-  → CellDownsample:             stride-2 → 25Hz
-  → Transformer 8L:             512d, h8, causal windowed, RoPE, SwiGLU
-  → Q2D2 projection:            Linear(512→6) → rhombic quantizer (3 pairs × L=11, 10.8M codebook)
-  → Content expand:             residual MLP(768→256→768)
+WavLM L4 CNN (200Hz, 5 causal convs @16kHz, 10ms delay)
+  → StridingAdapter:            CausalConv1d k4 s4 (200→50Hz, learned downsample)
+  → Conv stem:          depthwise dilated CausalConv ×8 + skip connections
+  → CellDownsample:     stride-2 → 25Hz
+  → Transformer 8L:     512d, h8, causal windowed, RoPE, SwiGLU
+  → Q2D2 projection:    Linear(512→6) → rhombic quantizer (3 pairs × L=9, 3.0M codebook)
+  → Content expand:     residual MLP(768→256→768)
   → content (768d) @25Hz
 
-cos768 vs teacher: 0.935 (probe, 8L StridingAdapter + Q2D2 L=11)
-Algorithmic latency: ~12ms (WavLM CNN) + 0ms (all downstream causal)
-Params: 25.4M
-```
+Checkpoint: striding_8l_200hz.best.pt (epoch 49)
+cos768 vs teacher: 0.935
+Algorithmic latency: ~10ms (WavLM CNN) + 2ms (StridingAdapter) = ~12ms total
+Params: 24.9M
 
 ---
 
@@ -142,7 +142,7 @@ content(768) + speaker(128)
 
 | Component | Teacher | Our Encoder | Our Decoders |
 |-----------|---------|-------------|--------------|
-| Content quantizer | FSQ (12.8K) | Q2D2 L=11 (10.8M) | — |
+| Content quantizer | FSQ (12.8K) | Q2D2 L=9 (3.0M) | — |
 | cos768 vs teacher | 1.0 | 0.935 | — |
 | Phase capability | Bidirectional 14L | — | Causal ≤10L |
 | Best wave_cos | — | — | 0.22 (MCS) |
