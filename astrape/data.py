@@ -179,6 +179,106 @@ def collate_phase0(batch):
 
 
 # ════════════════════════════════════════════════════════════════════
+# v8 acoustic-cascade dataset (content + 150Hz acoustics + audio + speaker)
+# ════════════════════════════════════════════════════════════════════
+
+AC_PER_CONTENT = 6            # 150Hz acoustic frames per 25Hz content frame
+SAMPLES_PER_CONTENT = 1764    # 44.1kHz samples per content frame
+
+
+class AcousticDataset(Dataset):
+    """Serves both v8 stages, crop-aligned to the content grid.
+
+    Stage A needs content + speaker + acoustic targets;  Stage B needs acoustic targets +
+    audio.  1 content frame = 6 acoustic frames = 1764 audio samples, so a random content
+    crop maps to exact acoustic / audio windows (no re-alignment).
+    """
+
+    def __init__(self, indices, content_dir, acoustics_dir, source_files, spk_names,
+                 speaker_emb_map, max_content_frames=50, seed=42,
+                 need_content=True, need_audio=True):
+        self.indices = [int(i) for i in indices]
+        self.content_dir = Path(content_dir)
+        self.acoustics_dir = Path(acoustics_dir)
+        self.source_files = source_files
+        self.spk_names = spk_names
+        self.speaker_emb_map = speaker_emb_map
+        self._spk_fallback = torch.stack(list(speaker_emb_map.values())).mean(0)
+        self.max_cf = max_content_frames
+        self.need_content = need_content
+        self.need_audio = need_audio
+        self.rng = random.Random(seed)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        idx = self.indices[i]
+        cf = self.max_cf
+        with np.load(self.acoustics_dir / f"s_{idx:05d}.npz", allow_pickle=False) as az:
+            mel = torch.from_numpy(az["mel"].astype(np.float32))       # (6Tc, 80)
+            logf0 = torch.from_numpy(az["logf0"].astype(np.float32))
+            voiced = torch.from_numpy(az["voiced"].astype(np.float32))
+            energy = torch.from_numpy(az["energy"].astype(np.float32))
+        Tc = mel.shape[0] // AC_PER_CONTENT
+
+        content = None
+        if self.need_content:
+            content = torch.from_numpy(_io_retry(lambda: np.load(
+                self.content_dir / f"s_{idx:05d}.npy", allow_pickle=False).astype(np.float32)))
+            Tc = min(Tc, content.shape[0])
+
+        # ── choose content-frame crop window ──
+        if Tc <= cf:
+            cf_start, pad_cf = 0, cf - Tc
+        else:
+            cf_start, pad_cf = self.rng.randint(0, Tc - cf), 0
+        a0, a1 = cf_start * AC_PER_CONTENT, (cf_start + cf - pad_cf) * AC_PER_CONTENT
+
+        def crop_ac(x):                                    # (6Tc, ...) → (6cf, ...)
+            x = x[a0:a1]
+            if pad_cf:
+                x = F.pad(x, (0, 0) * (x.dim() - 1) + (0, pad_cf * AC_PER_CONTENT))
+            return x
+
+        out = {"idx": idx,
+               "mel": crop_ac(mel), "logf0": crop_ac(logf0),
+               "voiced": crop_ac(voiced), "energy": crop_ac(energy)}
+
+        if self.need_content:
+            c = content[cf_start:cf_start + cf - pad_cf]
+            out["content"] = F.pad(c, (0, 0, 0, pad_cf)) if pad_cf else c
+
+        spk_id = str(self.spk_names[idx])
+        out["speaker"] = self.speaker_emb_map.get(spk_id, self._spk_fallback).clone()
+
+        if self.need_audio:
+            import soundfile as sf
+            s0 = cf_start * SAMPLES_PER_CONTENT
+            n = cf * SAMPLES_PER_CONTENT
+            wave, sr = _io_retry(lambda: sf.read(str(self.source_files[idx]), dtype="float32"))
+            wave = torch.from_numpy(np.asarray(wave))
+            if wave.ndim == 2:
+                wave = wave.mean(1)
+            if sr != S:
+                wave = torchaudio.functional.resample(wave.unsqueeze(0), sr, S).squeeze(0)
+            seg = wave[s0:s0 + n]
+            out["audio"] = F.pad(seg, (0, n - seg.shape[0])) if seg.shape[0] < n else seg
+        return out
+
+
+def collate_acoustic(batch):
+    out = {k: torch.stack([b[k] for b in batch])
+           for k in ("mel", "logf0", "voiced", "energy", "speaker")}
+    if "content" in batch[0]:
+        out["content"] = torch.stack([b["content"] for b in batch])
+    if "audio" in batch[0]:
+        out["audio"] = torch.stack([b["audio"] for b in batch])
+    out["idx"] = [b["idx"] for b in batch]
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════
 # Encoder-side dataset (compact VCTK cache → Batch), moved from mcs_common.py
 # ════════════════════════════════════════════════════════════════════
 
